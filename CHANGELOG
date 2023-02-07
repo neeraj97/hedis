@@ -1,5 +1,10 @@
 # Changelog for Hedis
 
+## 0.15.2
+* PR #14. Updated with hedis upstream
+* PR #13. Added timeout for commands
+* PR #11. Send the command to another node while exception occurred on running the query.
+
 ## 0.15.1
 
 * PR #181. Add MonadUnliftIO instance
