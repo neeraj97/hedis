@@ -26,6 +26,7 @@ import Control.Monad.Fail(MonadFail)
 import qualified Data.ByteString as B
 import Data.IORef
 
+import Database.Redis.Core.Internal
 import Database.Redis.Protocol
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Types
@@ -33,28 +34,6 @@ import Database.Redis.Cluster(ShardMap)
 import qualified Database.Redis.Cluster as Cluster
 
 --------------------------------------------------------------------------------
--- The Redis Monad
---
-
--- |Context for normal command execution, outside of transactions. Use
---  'runRedis' to run actions of this type.
---
---  In this context, each result is wrapped in an 'Either' to account for the
---  possibility of Redis returning an 'Error' reply.
-newtype Redis a = Redis (ReaderT RedisEnv IO a)
-    deriving (Monad, MonadIO, Functor, Applicative)
-
-#if __GLASGOW_HASKELL__ > 711
-deriving instance MonadFail Redis
-#endif
-
-data RedisEnv
-    = NonClusteredEnv { envConn :: PP.Connection, envLastReply :: IORef Reply }
-    | ClusteredEnv
-        { refreshAction :: IO ShardMap
-        , connection :: Cluster.Connection
-        }
-
 -- |This class captures the following behaviour: In a context @m@, a command
 --  will return its result wrapped in a \"container\" of type @f@.
 --
@@ -100,8 +79,10 @@ runRedisInternal conn (Redis redis) = do
 
 runRedisClusteredInternal :: Cluster.Connection -> IO ShardMap -> Redis a -> IO a
 runRedisClusteredInternal connection refreshShardmapAction (Redis redis) = do
-    r <- runReaderT redis (ClusteredEnv refreshShardmapAction connection)
-    r `seq` return ()
+    ref <- newIORef (SingleLine "nobody will ever see this")
+    pipelineVar <- Cluster.newPipelineVar
+    r <- runReaderT redis (ClusteredEnv refreshShardmapAction connection ref pipelineVar)
+    readIORef ref >>= (`seq` return ())
     return r
 
 setLastReply :: Reply -> ReaderT RedisEnv IO ()
@@ -141,5 +122,8 @@ sendRequest req = do
                 r <- liftIO $ PP.request envConn (renderRequest req)
                 setLastReply r
                 return r
-            ClusteredEnv{..} -> liftIO $ Cluster.requestPipelined refreshAction connection req
+            ClusteredEnv{..} -> do
+                r <- liftIO $ Cluster.requestPipelined refreshAction connection pipelineVar req
+                lift (writeIORef clusteredLastReply r)
+                return r
     returnDecode r'
