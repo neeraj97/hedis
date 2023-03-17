@@ -14,7 +14,7 @@ module Database.Redis.Cluster
   , Shard(..)
   , TimeoutException(..)
   , connect
-  , disconnect
+  , destroyNodeResources
   , requestPipelined
   , requestMasterNodes
   , nodes
@@ -28,6 +28,7 @@ import Data.List(nub, sortBy, find)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
+import Data.Pool(Pool, createPool, withResource, destroyAllResources)
 import Control.Concurrent.Async(race)
 import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
@@ -62,7 +63,7 @@ type IsReadOnly = Bool
 data Connection = Connection (HM.HashMap NodeID NodeConnection) (MVar Pipeline) (MVar ShardMap) CMD.InfoMap IsReadOnly
 
 -- | A connection to a single node in the cluster, similar to 'ProtocolPipelining.Connection'
-data NodeConnection = NodeConnection CC.ConnectionContext (IOR.IORef (Maybe B.ByteString)) NodeID
+data NodeConnection = NodeConnection (Pool CC.ConnectionContext) (IOR.IORef (Maybe B.ByteString)) NodeID
 
 instance Show NodeConnection where
     show (NodeConnection _ _ id1) = "nodeId: " <> show id1
@@ -128,8 +129,8 @@ instance Exception NoNodeException
 data TimeoutException = TimeoutException String deriving (Show, Typeable)
 instance Exception TimeoutException
 
-connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> ([NodeConnection] -> IO ShardMap) -> IO Connection
-connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap = do
+connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> ([NodeConnection] -> IO ShardMap) -> Time.NominalDiffTime -> Int -> IO Connection
+connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap idleTime maxResources = do
         shardMap <- readMVar shardMapVar
         stateVar <- newMVar $ Pending []
         pipelineVar <- newMVar $ Pipeline stateVar
@@ -161,15 +162,15 @@ connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap 
            ) (mempty, False) info
     connectNode :: Node -> IO (NodeID, NodeConnection)
     connectNode (Node n _ host port) = do
-        ctx <- withAuth host (CC.PortNumber $ toEnum port) timeoutOpt
+        ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
         ref <- IOR.newIORef Nothing
         return (n, NodeConnection ctx ref n)
     refreshShardMapVar :: ShardMap -> IO ()
     refreshShardMapVar shardMap = hasLocked $ modifyMVar_ shardMapVar (const (pure shardMap))
 
-disconnect :: Connection -> IO ()
-disconnect (Connection nodeConnMap _ _ _ _ ) = mapM_ disconnectNode (HM.elems nodeConnMap) where
-    disconnectNode (NodeConnection nodeCtx _ _) = CC.disconnect nodeCtx
+destroyNodeResources :: Connection -> IO ()
+destroyNodeResources (Connection nodeConnMap _ _ _ _ ) = mapM_ disconnectNode (HM.elems nodeConnMap) where
+    disconnectNode (NodeConnection nodePool _ _) = destroyAllResources nodePool
 
 -- Add a request to the current pipeline for this connection. The pipeline will
 -- be executed implicitly as soon as any result returned from this function is
@@ -453,34 +454,33 @@ allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
     onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
-requestNode (NodeConnection ctx lastRecvRef _) requests = do
+requestNode (NodeConnection pool lastRecvRef _) requests = do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- race requestNodeImpl (threadDelay envTimeout)
+    eresp <- race (withResource pool requestNodeImpl) (threadDelay envTimeout)
     case eresp of
       Left e -> return e
       Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
-
     where
-    requestNodeImpl :: IO [Reply]
-    requestNodeImpl = do
-        mapM_ (sendNode . renderRequest) requests
+    requestNodeImpl :: CC.ConnectionContext -> IO [Reply]
+    requestNodeImpl ctx = do
+        mapM_ (sendNode ctx . renderRequest) requests
         _ <- CC.flush ctx
-        replicateM (length requests) recvNode
-    sendNode :: B.ByteString -> IO ()
-    sendNode = CC.send ctx
-    recvNode :: IO Reply
-    recvNode = do
+        replicateM (length requests) $ recvNode ctx
+    sendNode :: CC.ConnectionContext -> B.ByteString -> IO ()
+    sendNode = CC.send
+    recvNode :: CC.ConnectionContext -> IO Reply
+    recvNode ctx = do
         maybeLastRecv <- IOR.readIORef lastRecvRef
         scanResult <- case maybeLastRecv of
             Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv
             Nothing -> Scanner.scanWith (CC.recv ctx) reply B.empty
 
         case scanResult of
-          Scanner.Fail{}       -> CC.errConnClosed
-          Scanner.More{}    -> error "Hedis: parseWith returned Partial"
-          Scanner.Done rest' r -> do
-            IOR.writeIORef lastRecvRef (Just rest')
-            return r
+            Scanner.Fail{}       -> CC.errConnClosed
+            Scanner.More{}    -> error "Hedis: parseWith returned Partial"
+            Scanner.Done rest' r -> do
+                IOR.writeIORef lastRecvRef (Just rest')
+                return r
 
 {-# INLINE nodes #-}
 nodes :: ShardMap -> [Node]
