@@ -121,7 +121,7 @@ instance Exception CrossSlotException
 data NoNodeException = NoNodeException  deriving (Show, Typeable)
 instance Exception NoNodeException
 
-connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> (NodeConnection -> IO ShardMap) -> IO Connection
+connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> ([NodeConnection] -> IO ShardMap) -> IO Connection
 connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap = do
         shardMap <- readMVar shardMapVar
         stateVar <- newMVar $ Pending []
@@ -134,7 +134,7 @@ connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap 
           if shouldRetry
             then if not (HM.null eNodeConns)
                     then do
-                      newShardMap <- refreshShardMap (head $ HM.elems eNodeConns)
+                      newShardMap <- refreshShardMap (HM.elems eNodeConns)
                       refreshShardMapVar newShardMap
                       simpleNodeConnections newShardMap
                     else
