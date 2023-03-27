@@ -1,6 +1,8 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Database.Redis.Connection where
 
 import Control.Exception
@@ -25,7 +27,10 @@ import Database.Redis.Protocol(Reply(..))
 import Database.Redis.Cluster(ShardMap(..), Node, Shard(..))
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
+import           Control.Concurrent (threadDelay)
+import           Control.Concurrent.Async (race)
 --import qualified Database.Redis.Cluster.Pipeline as ClusterPipeline
+
 import Database.Redis.Commands
     ( ping
     , select
@@ -267,12 +272,23 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
 
 refreshShardMap :: Cluster.Connection -> IO ShardMap
 refreshShardMap (Cluster.Connection nodeConns _ _ _ _) =
-    refreshShardMapWithNodeConn (head $ HM.elems nodeConns)
+    refreshShardMapWithNodeConn (HM.elems nodeConns)
 
-refreshShardMapWithNodeConn :: Cluster.NodeConnection -> IO ShardMap
-refreshShardMapWithNodeConn (Cluster.NodeConnection ctx _ _) = do
+refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
+refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+refreshShardMapWithNodeConn ((Cluster.NodeConnection ctx _ _) : xs) = do
     pipelineConn <- PP.fromCtx ctx
-    refreshShardMapWithConn pipelineConn True
+    raceResult <- race (threadDelay (10^(3 :: Int))) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of 1 ms 
+    case raceResult of
+        Left () -> do
+            print $ "TimeoutForConnection " <> show ctx 
+            refreshShardMapWithNodeConn xs
+        Right eiShardMapResp -> 
+            case eiShardMapResp of
+                Right shardMap -> pure shardMap 
+                Left (err :: SomeException) -> do
+                    print $ "ShardMapRefreshError-" <> show err 
+                    refreshShardMapWithNodeConn xs
 
 refreshShardMapWithConn :: PP.Connection -> Bool -> IO ShardMap
 refreshShardMapWithConn pipelineConn _ = do
