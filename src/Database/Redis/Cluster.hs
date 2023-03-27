@@ -63,6 +63,9 @@ data Connection = Connection (HM.HashMap NodeID NodeConnection) (MVar Pipeline) 
 -- | A connection to a single node in the cluster, similar to 'ProtocolPipelining.Connection'
 data NodeConnection = NodeConnection CC.ConnectionContext (IOR.IORef (Maybe B.ByteString)) NodeID
 
+instance Show NodeConnection where
+    show (NodeConnection _ _ id1) = "nodeId: " <> show id1
+
 instance Eq NodeConnection where
     (NodeConnection _ _ id1) == (NodeConnection _ _ id2) = id1 == id2
 
@@ -239,7 +242,13 @@ rawResponse (CompletedRequest _ _ r) = r
 evaluatePipeline :: MVar ShardMap -> IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
 evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         shardMap <- hasLocked $ readMVar shardMapVar
-        requestsByNode <- getRequestsByNode shardMap
+        erequestsByNode <- try $ getRequestsByNode shardMap
+        requestsByNode <- case erequestsByNode of
+            Right reqByNode-> pure reqByNode
+            Left (_ :: MissingNodeException) -> do
+                refreshShardMapVar
+                newShardMap <- hasLocked $ readMVar shardMapVar
+                getRequestsByNode newShardMap
         -- catch the exception thrown at each node level
         -- send the command to random node.
         -- merge the current responses with new responses.

@@ -280,4 +280,6 @@ refreshShardMapWithConn pipelineConn _ = do
     slotsResponse <- runRedisInternal pipelineConn clusterSlots
     case slotsResponse of
         Left e -> throwIO $ ClusterConnectError e
-        Right slots -> shardMapFromClusterSlotsResponse slots
+        Right slots -> case clusterSlotsResponseEntries slots of 
+            [] -> throwIO $ ClusterConnectError $ SingleLine "empty slotsResponse"
+            _ -> shardMapFromClusterSlotsResponse slots
