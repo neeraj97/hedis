@@ -24,10 +24,10 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.IORef as IOR
 import Data.Maybe(mapMaybe, fromMaybe)
-import Data.List(nub, sortBy, find, isPrefixOf)
+import Data.List(nub, sortBy, find)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
-import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, displayException)
+import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
 import Control.Concurrent.Async(race)
 import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
@@ -268,9 +268,9 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
           mapM (\(resp, (cc, r)) -> case resp of
               Right v -> return v
               Left (err :: SomeException) ->
-                if isPrefixOf "TimeoutException" (displayException err)
-                  then throwIO err
-                  else executeRequests (getRandomConnection cc conn) r
+                case fromException err of
+                  Just (er :: TimeoutException) -> throwIO er
+                  _ -> executeRequests (getRandomConnection cc conn) r
             ) (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
         when (any (moved . rawResponse) resps) refreshShardMapVar
