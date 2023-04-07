@@ -12,6 +12,7 @@ module Database.Redis.Cluster
   , ShardMap(..)
   , HashSlot
   , Shard(..)
+  , TimeoutException(..)
   , connect
   , disconnect
   , requestPipelined
@@ -23,7 +24,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.IORef as IOR
 import Data.Maybe(mapMaybe, fromMaybe)
-import Data.List(nub, sortBy, find)
+import Data.List(nub, sortBy, find, isPrefixOf)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, displayException)
@@ -124,7 +125,7 @@ instance Exception CrossSlotException
 data NoNodeException = NoNodeException  deriving (Show, Typeable)
 instance Exception NoNodeException
 
-data TimeoutException = TimeoutException deriving (Show, Typeable)
+data TimeoutException = TimeoutException String deriving (Show, Typeable)
 instance Exception TimeoutException
 
 connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> ([NodeConnection] -> IO ShardMap) -> IO Connection
@@ -266,10 +267,10 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         resps <- concat <$>
           mapM (\(resp, (cc, r)) -> case resp of
               Right v -> return v
-              Left (e :: SomeException) ->
-                case displayException e of
-                  "TimeoutException" -> throwIO TimeoutException
-                  _ -> executeRequests (getRandomConnection cc conn) r
+              Left (err :: SomeException) ->
+                if isPrefixOf "TimeoutException" (displayException err)
+                  then throwIO err
+                  else executeRequests (getRandomConnection cc conn) r
             ) (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
         when (any (moved . rawResponse) resps) refreshShardMapVar
@@ -457,7 +458,7 @@ requestNode (NodeConnection ctx lastRecvRef _) requests = do
     eresp <- race requestNodeImpl (threadDelay envTimeout)
     case eresp of
       Left e -> return e
-      Right _ -> putStrLn "timeout happened" *> throwIO TimeoutException
+      Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
 
     where
     requestNodeImpl :: IO [Reply]
