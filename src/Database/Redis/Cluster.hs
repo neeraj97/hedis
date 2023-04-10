@@ -454,9 +454,9 @@ allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
     onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
-requestNode (NodeConnection pool lastRecvRef _) requests = do
+requestNode (NodeConnection pool lastRecvRef _) requests = withResource pool $ \ctx -> do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- race (withResource pool requestNodeImpl) (threadDelay envTimeout)
+    eresp <- race (requestNodeImpl ctx) (threadDelay envTimeout)
     case eresp of
       Left e -> return e
       Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
