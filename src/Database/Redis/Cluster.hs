@@ -12,6 +12,7 @@ module Database.Redis.Cluster
   , ShardMap(..)
   , HashSlot
   , Shard(..)
+  , TimeoutException(..)
   , connect
   , disconnect
   , requestPipelined
@@ -26,7 +27,7 @@ import Data.Maybe(mapMaybe, fromMaybe)
 import Data.List(nub, sortBy, find)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
-import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try)
+import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
 import Control.Concurrent.Async(race)
 import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
@@ -123,6 +124,9 @@ instance Exception CrossSlotException
 
 data NoNodeException = NoNodeException  deriving (Show, Typeable)
 instance Exception NoNodeException
+
+data TimeoutException = TimeoutException String deriving (Show, Typeable)
+instance Exception TimeoutException
 
 connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Maybe Int -> Bool -> ([NodeConnection] -> IO ShardMap) -> IO Connection
 connect withAuth commandInfos shardMapVar timeoutOpt isReadOnly refreshShardMap = do
@@ -256,10 +260,18 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         -- take a random connection where there are no exceptions.
         -- PERF_CONCERN: Since usually we send only one request at time, this won't be
         -- heavy perf issue. but still should be evaluated and figured out with complete rewrite.
-        resps <- concat <$> mapM (\(resp, (cc, r)) -> case resp of
-                                        Right v -> return v
-                                        Left (_ :: SomeException) ->  executeRequests (getRandomConnection cc conn) r
-                      ) (zip eresps requestsByNode)
+
+        -- throwing exception for timeouts thus closing the connection instead of retrying.
+        -- otherwise if there is any response in the connection buffer it'll get forwarded to other requests that are reusing the same connection.
+        -- leading to jumbled up responses
+        resps <- concat <$>
+          mapM (\(resp, (cc, r)) -> case resp of
+              Right v -> return v
+              Left (err :: SomeException) ->
+                case fromException err of
+                  Just (er :: TimeoutException) -> throwIO er
+                  _ -> executeRequests (getRandomConnection cc conn) r
+            ) (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
         when (any (moved . rawResponse) resps) refreshShardMapVar
         retriedResps <- mapM (retry 0) resps
@@ -446,7 +458,7 @@ requestNode (NodeConnection ctx lastRecvRef _) requests = do
     eresp <- race requestNodeImpl (threadDelay envTimeout)
     case eresp of
       Left e -> return e
-      Right _ -> putStrLn "timeout happened" *> throwIO NoNodeException
+      Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
 
     where
     requestNodeImpl :: IO [Reply]

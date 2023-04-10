@@ -20,6 +20,10 @@ import qualified Data.Time as Time
 import Network.TLS (ClientParams)
 import qualified Network.Socket as NS
 import qualified Data.HashMap.Strict as HM
+import System.Random (randomRIO)
+import System.Environment (lookupEnv)
+import Data.Maybe (fromMaybe)
+import Text.Read (readMaybe)
 
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Core(Redis, runRedisInternal, runRedisClusteredInternal)
@@ -276,19 +280,22 @@ refreshShardMap (Cluster.Connection nodeConns _ _ _ _) =
 
 refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
 refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
-refreshShardMapWithNodeConn ((Cluster.NodeConnection ctx _ _) : xs) = do
+refreshShardMapWithNodeConn nodeConnsList = do
+    selectedIdx <- randomRIO (0, (length nodeConnsList) - 1)
+    let (Cluster.NodeConnection ctx _ _) = nodeConnsList !! selectedIdx
     pipelineConn <- PP.fromCtx ctx
-    raceResult <- race (threadDelay (10^(3 :: Int))) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of 1 ms 
+    envTimeout <- fromMaybe (10 ^ (3 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
+    raceResult <- race (threadDelay envTimeout) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 1 ms 
     case raceResult of
         Left () -> do
             print $ "TimeoutForConnection " <> show ctx 
-            refreshShardMapWithNodeConn xs
+            throwIO $ Cluster.TimeoutException "ClusterSlots Timeout"
         Right eiShardMapResp -> 
             case eiShardMapResp of
                 Right shardMap -> pure shardMap 
                 Left (err :: SomeException) -> do
                     print $ "ShardMapRefreshError-" <> show err 
-                    refreshShardMapWithNodeConn xs
+                    throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
 
 refreshShardMapWithConn :: PP.Connection -> Bool -> IO ShardMap
 refreshShardMapWithConn pipelineConn _ = do
