@@ -303,12 +303,14 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
         in
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
-refreshCluster :: Cluster.Connection -> IO ()
-refreshCluster conn@(Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
-    newShardMap <- refreshShardMap conn
+refreshShardMap :: Cluster.Connection -> IO ShardMap
+refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
+    nodeConns <- readMVar nodeConnsVar
+    newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
     modifyMVar_ nodeConnsVar $ \_ -> do
         putMVar shardMapVar newShardMap
         simpleNodeConnections newShardMap
+    return newShardMap
     where
         withAuth = tcpConnWithAuth connectAuth connectTLSParams
         simpleNodeConnections :: ShardMap -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
@@ -318,11 +320,6 @@ refreshCluster conn@(Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.T
             ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
             ref <- IOR.newIORef Nothing
             return (n, Cluster.NodeConnection ctx ref n)
-
-refreshShardMap :: Cluster.Connection -> IO ShardMap
-refreshShardMap (Cluster.Connection nodeConnsVar _ _ _ _ _) = do
-    nodeConns <- readMVar nodeConnsVar
-    refreshShardMapWithNodeConn (HM.elems nodeConns)
 
 refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
 refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
