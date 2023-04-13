@@ -321,12 +321,12 @@ refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpIn
         withAuth :: Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
         withAuth = tcpConnWithAuth connectAuth connectTLSParams
         updateNodeConnections :: ShardMap -> HM.HashMap Cluster.NodeID Cluster.NodeConnection -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
-        updateNodeConnections shardMap oldMap = HM.fromList <$> mapM (lookupAndConnect oldMap) (nub $ Cluster.nodes shardMap)
-        lookupAndConnect :: HM.HashMap Cluster.NodeID Cluster.NodeConnection -> Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
-        lookupAndConnect oldMap node@(Cluster.Node n _ _ _) =
-            case HM.lookup n oldMap of
-                Just val -> return (n, val)
-                Nothing  -> connectNode node
+        updateNodeConnections shardMap oldMap =
+            connectAndAppend oldMap $ filter ((`HM.member` oldMap) . (\(Cluster.Node n _ _ _) -> n)) (nub $ Cluster.nodes shardMap)
+        connectAndAppend :: HM.HashMap Cluster.NodeID Cluster.NodeConnection -> [Cluster.Node] -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
+        connectAndAppend oldMap nodes = do
+            conns <- mapM connectNode nodes
+            return $ foldl (\acc (k, v) -> HM.insert k v acc) oldMap conns
         connectNode :: Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
         connectNode (Cluster.Node n _ host port) = do
             ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
