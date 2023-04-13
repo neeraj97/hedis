@@ -9,6 +9,7 @@ import Control.Exception
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
+import Control.Concurrent(forkIO)
 import Control.Concurrent.MVar(MVar, newMVar, putMVar, readMVar, modifyMVar_)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
@@ -33,10 +34,10 @@ import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async (race)
-import qualified Database.Redis.Types as T
 --import qualified Database.Redis.Cluster.Pipeline as ClusterPipeline
 import qualified Data.IORef as IOR
 import Data.List (nub)
+import Data.Maybe (catMaybes)
 
 import Database.Redis.Commands
     ( ping
@@ -247,14 +248,19 @@ connectCluster bootstrapConnInfo = do
       clusterConnect readOnlyConnection connection = do
           clusterConn@(Cluster.Connection nodeMapVar _ _ _ _ _) <- connection
           nodeMap <- readMVar nodeMapVar
-          nodesConns <-  sequence $ (ctxToConn . snd) <$> (HM.toList nodeMap)
-          when readOnlyConnection $
-                  mapM_ (\maybeConn -> case maybeConn of
-                            Just conn -> do
-                                PP.beginReceiving conn
-                                runRedisInternal conn readOnly
-                            Nothing -> return $ Right (T.Status "Connection does not exist")
-                      ) nodesConns
+          let nodeList = HM.toList nodeMap
+          maybeConns <- sequence $ (ctxToConn . snd) <$> nodeList
+          let nodeConnsPair = zip maybeConns nodeList
+          workingNodes <- mapM (\(maybeConn, nodeConn) -> case maybeConn of
+                    Just conn -> do
+                        when readOnlyConnection $ do
+                            PP.beginReceiving conn
+                            runRedisInternal conn readOnly >> return ()
+                        return $ Just nodeConn
+                    Nothing -> return Nothing
+                ) nodeConnsPair
+          let newMap = HM.fromList $ catMaybes workingNodes
+          _ <- forkIO $ putMVar nodeMapVar newMap
           return clusterConn
           where
           ctxToConn :: Cluster.NodeConnection -> IO (Maybe PP.Connection)
@@ -307,14 +313,20 @@ refreshShardMap :: Cluster.Connection -> IO ShardMap
 refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
     nodeConns <- readMVar nodeConnsVar
     newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
-    modifyMVar_ nodeConnsVar $ \_ -> do
+    modifyMVar_ nodeConnsVar $ \oldMap -> do
         putMVar shardMapVar newShardMap
-        simpleNodeConnections newShardMap
+        updateNodeConnections newShardMap oldMap
     return newShardMap
     where
+        withAuth :: Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
         withAuth = tcpConnWithAuth connectAuth connectTLSParams
-        simpleNodeConnections :: ShardMap -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
-        simpleNodeConnections shardMap = HM.fromList <$> mapM connectNode (nub $ Cluster.nodes shardMap)
+        updateNodeConnections :: ShardMap -> HM.HashMap Cluster.NodeID Cluster.NodeConnection -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
+        updateNodeConnections shardMap oldMap = HM.fromList <$> mapM (lookupAndConnect oldMap) (nub $ Cluster.nodes shardMap)
+        lookupAndConnect :: HM.HashMap Cluster.NodeID Cluster.NodeConnection -> Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
+        lookupAndConnect oldMap node@(Cluster.Node n _ _ _) =
+            case HM.lookup n oldMap of
+                Just val -> return (n, val)
+                Nothing  -> connectNode node
         connectNode :: Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
         connectNode (Cluster.Node n _ host port) = do
             ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
