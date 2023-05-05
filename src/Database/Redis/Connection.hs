@@ -9,9 +9,8 @@ import Control.Exception
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
+import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar_, tryTakeMVar, putMVar)
 import Control.Concurrent(forkIO)
-import Control.Concurrent.STM.TMVar(TMVar, newTMVar, readTMVar, tryTakeTMVar, putTMVar)
-import GHC.Conc (atomically)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
@@ -30,7 +29,7 @@ import Text.Read (readMaybe)
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Core(Redis, runRedisInternal, runRedisClusteredInternal)
 import Database.Redis.Protocol(Reply(..))
-import Database.Redis.Cluster(ShardMap(..), Node, Shard(..), modifyTMVar)
+import Database.Redis.Cluster(ShardMap(..), Node, Shard(..))
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
 import           Control.Concurrent (threadDelay)
@@ -57,7 +56,7 @@ import Database.Redis.Commands
 --  'connect' function to create one.
 data Connection
     = NonClusteredConnection (Pool PP.Connection)
-    | ClusteredConnection (TMVar (ShardMap, Time.UTCTime)) Cluster.Connection
+    | ClusteredConnection (MVar ShardMap) Cluster.Connection
 
 -- |Information for connnecting to a Redis server.
 --
@@ -223,8 +222,7 @@ connectCluster bootstrapConnInfo = do
         Left e -> throwIO $ ClusterConnectError e
         Right slots -> do
             shardMap <- shardMapFromClusterSlotsResponse slots
-            now <- Time.getCurrentTime
-            atomically $ newTMVar (shardMap, now)
+            newMVar shardMap
     commandInfos <- runRedisInternal conn command
     case commandInfos of
         Left e -> throwIO $ ClusterConnectError e
@@ -250,7 +248,7 @@ connectCluster bootstrapConnInfo = do
       clusterConnect :: Bool -> IO Cluster.Connection -> IO Cluster.Connection
       clusterConnect readOnlyConnection connection = do
           clusterConn@(Cluster.Connection nodeMapVar _ _ _ _ _) <- connection
-          nodeMap <- atomically $ readTMVar nodeMapVar
+          nodeMap <- readMVar nodeMapVar
           let nodeList = HM.toList nodeMap
           maybeConns <- sequence $ (ctxToConn . snd) <$> nodeList
           let nodeConnsPair = zip maybeConns nodeList
@@ -263,7 +261,7 @@ connectCluster bootstrapConnInfo = do
                     Nothing -> return Nothing
                 ) nodeConnsPair
           let newMap = HM.fromList $ catMaybes workingNodes
-          _ <- forkIO $ modifyTMVar nodeMapVar newMap
+          _ <- forkIO $ modifyMVar_ nodeMapVar (\_ -> return newMap)
           return clusterConn
           where
           ctxToConn :: Cluster.NodeConnection -> IO (Maybe PP.Connection)
@@ -314,22 +312,19 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
 
 refreshShardMap :: Cluster.Connection -> IO ShardMap
 refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
-    putStrLn "Refresh called."
-    (oldShardMap, lastUpdated) <- atomically $ readTMVar shardMapVar
-    now <- Time.getCurrentTime
-    if Time.diffUTCTime now lastUpdated <= shardMapRefreshDelta
-    then return oldShardMap
-    else do
-        nodeConns <- atomically $ readTMVar nodeConnsVar
-        newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
-        newNodeConns <- nodeConnections newShardMap
-        atomically $ do
-            _ <- tryTakeTMVar shardMapVar
-            putTMVar shardMapVar (newShardMap, now)
-            _ <- tryTakeTMVar nodeConnsVar
-            putTMVar nodeConnsVar newNodeConns
-        putStrLn "ShardMap refreshed."
-        return newShardMap
+    putStrLn "ShardMap Refreshed."
+    maybeShardMap <- tryTakeMVar shardMapVar
+    case maybeShardMap of
+        Nothing -> readMVar shardMapVar
+        Just _ -> do
+            maybeNodeConns <- tryTakeMVar nodeConnsVar
+            nodeConns <- case maybeNodeConns of
+                Nothing -> readMVar nodeConnsVar
+                Just nodeConns -> return nodeConns
+            newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
+            nodeConnections newShardMap >>= putMVar nodeConnsVar
+            putMVar shardMapVar newShardMap
+            return newShardMap
     where
         withAuth :: Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
         withAuth = tcpConnWithAuth connectAuth connectTLSParams
