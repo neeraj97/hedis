@@ -31,8 +31,6 @@ import Database.Redis.Protocol(Reply(..))
 import Database.Redis.Cluster(ShardMap(..), Node, Shard(..))
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
-import           Control.Concurrent (threadDelay)
-import           Control.Concurrent.Async (race)
 --import qualified Database.Redis.Cluster.Pipeline as ClusterPipeline
 
 import Database.Redis.Commands
@@ -45,6 +43,7 @@ import Database.Redis.Commands
     , ClusterSlotsResponse(..)
     , ClusterSlotsResponseEntry(..)
     , ClusterSlotsNode(..))
+import qualified System.Timeout as T
 
 --------------------------------------------------------------------------------
 -- Connection
@@ -285,12 +284,12 @@ refreshShardMapWithNodeConn nodeConnsList = do
     let (Cluster.NodeConnection ctx _ _) = nodeConnsList !! selectedIdx
     pipelineConn <- PP.fromCtx ctx
     envTimeout <- fromMaybe (10 ^ (3 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
-    raceResult <- race (threadDelay envTimeout) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 1 ms 
+    raceResult <- T.timeout envTimeout (try $ refreshShardMapWithConn pipelineConn True)-- racing with delay of default 1 ms 
     case raceResult of
-        Left () -> do
+        Nothing -> do
             print $ "TimeoutForConnection " <> show ctx 
             throwIO $ Cluster.TimeoutException "ClusterSlots Timeout"
-        Right eiShardMapResp -> 
+        Just eiShardMapResp -> 
             case eiShardMapResp of
                 Right shardMap -> pure shardMap 
                 Left (err :: SomeException) -> do

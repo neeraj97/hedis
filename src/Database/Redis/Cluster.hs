@@ -28,8 +28,6 @@ import Data.List(nub, sortBy, find)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
-import Control.Concurrent.Async(race)
-import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
 import Control.Monad(zipWithM, when, replicateM)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
@@ -45,6 +43,7 @@ import Text.Read (readMaybe)
 
 import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
+import System.Timeout (timeout)
 
 -- This module implements a clustered connection whilst maintaining
 -- compatibility with the original Hedis codebase. In particular it still
@@ -455,10 +454,10 @@ allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection ctx lastRecvRef _) requests = do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- race requestNodeImpl (threadDelay envTimeout)
+    eresp <- timeout envTimeout requestNodeImpl 
     case eresp of
-      Left e -> return e
-      Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
+      Just e -> return e
+      Nothing -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
 
     where
     requestNodeImpl :: IO [Reply]
