@@ -25,6 +25,7 @@ module Database.Redis.Cluster
   , nodes
   , Pipeline
   , newPipelineVar
+  , NodeResource(..)
 ) where
 
 import qualified Data.ByteString as B
@@ -71,16 +72,18 @@ type IsReadOnly = Bool
 data Connection = Connection (MVar NodeConnectionMap) (MVar ShardMap) CMD.InfoMap IsReadOnly TcpInfo
 
 -- | A connection to a single node in the cluster, similar to 'ProtocolPipelining.Connection'
-data NodeConnection = NodeConnection (Pool CC.ConnectionContext) (IOR.IORef (Maybe B.ByteString)) NodeID
+data NodeConnection = NodeConnection (Pool NodeResource) NodeID
+
+data NodeResource = NodeResource CC.ConnectionContext (IOR.IORef (Maybe B.ByteString))
 
 instance Show NodeConnection where
-    show (NodeConnection _ _ id1) = "nodeId: " <> show id1
+    show (NodeConnection _ id1) = "nodeId: " <> show id1
 
 instance Eq NodeConnection where
-    (NodeConnection _ _ id1) == (NodeConnection _ _ id2) = id1 == id2
+    (NodeConnection _ id1) == (NodeConnection _ id2) = id1 == id2
 
 instance Ord NodeConnection where
-    compare (NodeConnection _ _ id1) (NodeConnection _ _ id2) = compare id1 id2
+    compare (NodeConnection _ id1) (NodeConnection _ id2) = compare id1 id2
 
 data PipelineState =
       -- Nothing in the pipeline has been evaluated yet so nothing has been
@@ -185,10 +188,16 @@ connect withAuth commandInfos shardMapVar isReadOnly refreshShardMap (tcpInfo@Tc
                     Left (_ :: SomeException) -> (acc, True)
            ) (mempty, False) info
     connectNode :: Node -> IO (NodeID, NodeConnection)
-    connectNode (Node n _ host port) = do
-        ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
+    connectNode node@(Node n _ _ _) = do
+        pool <- createPool (createNodeResource node) destroyNodeResource 1 idleTime maxResources
+        return (n, NodeConnection pool n)
+    createNodeResource :: Node -> IO NodeResource
+    createNodeResource (Node _ _ host port) = do
+        ctx <- withAuth host (CC.PortNumber $ toEnum port) timeoutOpt
         ref <- IOR.newIORef Nothing
-        return (n, NodeConnection ctx ref n)
+        return $ NodeResource ctx ref
+    destroyNodeResource :: NodeResource -> IO ()
+    destroyNodeResource (NodeResource ctx _) = CC.disconnect ctx
     refreshShardMapVar :: ShardMap -> IO ()
     refreshShardMapVar shardMap = hasLocked $ modifyMVar_ shardMapVar (const (pure shardMap))
 
@@ -199,7 +208,7 @@ newPipelineVar = do
 
 destroyNodeResources :: Connection -> IO ()
 destroyNodeResources (Connection nodeConnMapVar _ _ _ _) = (readMVar nodeConnMapVar) >>= (mapM_ disconnectNode . HM.elems) where
-    disconnectNode (NodeConnection nodePool _ _) = destroyAllResources nodePool
+    disconnectNode (NodeConnection nodePool _) = destroyAllResources nodePool
 
 -- Add a request to the current pipeline for this connection. The pipeline will
 -- be executed implicitly as soon as any result returned from this function is
@@ -494,22 +503,25 @@ allMasterNodes (Connection nodeConnsVar _ _ _ _) (ShardMap shardMap) = do
     onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
-requestNode (NodeConnection pool lastRecvRef _) requests = withResource pool $ \ctx -> do
+requestNode (NodeConnection pool _) requests = withResource pool (`requestNodeResource` requests)
+
+requestNodeResource :: NodeResource -> [[B.ByteString]] -> IO [Reply]
+requestNodeResource (NodeResource ctx lastRecvRef) requests = do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- race (requestNodeImpl ctx) (threadDelay envTimeout)
+    eresp <- race requestNodeImpl (threadDelay envTimeout)
     case eresp of
       Left e -> return e
       Right _ -> putStrLn "timeout happened" *> throwIO (RequestTimingOut requests)
     where
-    requestNodeImpl :: CC.ConnectionContext -> IO [Reply]
-    requestNodeImpl ctx = do
-        mapM_ (sendNode ctx . renderRequest) requests
+    requestNodeImpl :: IO [Reply]
+    requestNodeImpl = do
+        mapM_ (sendNode . renderRequest) requests
         _ <- CC.flush ctx
-        replicateM (length requests) $ recvNode ctx
-    sendNode :: CC.ConnectionContext -> B.ByteString -> IO ()
-    sendNode = CC.send
-    recvNode :: CC.ConnectionContext -> IO Reply
-    recvNode ctx = do
+        replicateM (length requests) $ recvNode
+    sendNode :: B.ByteString -> IO ()
+    sendNode = CC.send ctx
+    recvNode :: IO Reply
+    recvNode = do
         maybeLastRecv <- IOR.readIORef lastRecvRef
         scanResult <- case maybeLastRecv of
             Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv

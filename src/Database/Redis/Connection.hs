@@ -265,8 +265,8 @@ connectCluster bootstrapConnInfo = do
           return clusterConn
           where
           ctxToConn :: Cluster.NodeConnection -> IO (Maybe PP.Connection)
-          ctxToConn (Cluster.NodeConnection pool _ nid) = do
-            maybeConn <- try $ withResource pool PP.fromCtx
+          ctxToConn (Cluster.NodeConnection pool nid) = do
+            maybeConn <- try $ withResource pool (\(Cluster.NodeResource ctx _) -> PP.fromCtx ctx)
             case maybeConn of
                 Right ppConn -> return $ Just ppConn
                 Left (_ :: SomeException) -> do
@@ -337,18 +337,24 @@ refreshShardMap (Cluster.Connection nodeConnsVar shardMapVar _ _ Cluster.TcpInfo
                             Left (_ :: SomeException) -> acc
                 ) mempty info
         connectNode :: Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
-        connectNode (Cluster.Node n _ host port) = do
-            ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
+        connectNode node@(Cluster.Node n _ _ _) = do
+            pool <- createPool (createNodeResource node) destroyNodeResource 1 idleTime maxResources
+            return (n, Cluster.NodeConnection pool n)
+        createNodeResource :: Cluster.Node -> IO Cluster.NodeResource
+        createNodeResource (Cluster.Node _ _ host port) = do
+            ctx <- withAuth host (CC.PortNumber $ toEnum port) timeoutOpt
             ref <- IOR.newIORef Nothing
-            return (n, Cluster.NodeConnection ctx ref n)
+            return $ Cluster.NodeResource ctx ref
+        destroyNodeResource :: Cluster.NodeResource -> IO ()
+        destroyNodeResource (Cluster.NodeResource ctx _) = CC.disconnect ctx
 
 refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
 refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
 refreshShardMapWithNodeConn nodeConnsList = do
     selectedIdx <- randomRIO (0, (length nodeConnsList) - 1)
     print selectedIdx
-    let (Cluster.NodeConnection pool _ _) = nodeConnsList !! selectedIdx
-    withResource pool $ \ctx -> do
+    let (Cluster.NodeConnection pool _) = nodeConnsList !! selectedIdx
+    withResource pool $ \(Cluster.NodeResource ctx _) -> do
         pipelineConn <- PP.fromCtx ctx
         envTimeout <- fromMaybe (10 ^ (3 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
         raceResult <- race (threadDelay envTimeout) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 1 ms 
