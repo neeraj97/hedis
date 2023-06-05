@@ -74,7 +74,7 @@ data Connection = Connection (MVar NodeConnectionMap) (MVar ShardMap) CMD.InfoMa
 -- | A connection to a single node in the cluster, similar to 'ProtocolPipelining.Connection'
 data NodeConnection = NodeConnection (Pool NodeResource) NodeID
 
-data NodeResource = NodeResource CC.ConnectionContext (IOR.IORef (Maybe B.ByteString))
+newtype NodeResource = NodeResource (CC.ConnectionContext, (IOR.IORef (Maybe B.ByteString)))
 
 instance Show NodeConnection where
     show (NodeConnection _ id1) = "nodeId: " <> show id1
@@ -195,9 +195,9 @@ connect withAuth commandInfos shardMapVar isReadOnly refreshShardMap (tcpInfo@Tc
     createNodeResource (Node _ _ host port) = do
         ctx <- withAuth host (CC.PortNumber $ toEnum port) timeoutOpt
         ref <- IOR.newIORef Nothing
-        return $ NodeResource ctx ref
+        return $ NodeResource (ctx, ref)
     destroyNodeResource :: NodeResource -> IO ()
-    destroyNodeResource (NodeResource ctx _) = CC.disconnect ctx
+    destroyNodeResource (NodeResource (ctx, _)) = CC.disconnect ctx
     refreshShardMapVar :: ShardMap -> IO ()
     refreshShardMapVar shardMap = hasLocked $ modifyMVar_ shardMapVar (const (pure shardMap))
 
@@ -506,7 +506,7 @@ requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool _) requests = withResource pool (`requestNodeResource` requests)
 
 requestNodeResource :: NodeResource -> [[B.ByteString]] -> IO [Reply]
-requestNodeResource (NodeResource ctx lastRecvRef) requests = do
+requestNodeResource (NodeResource (ctx, lastRecvRef)) requests = do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
     eresp <- race requestNodeImpl (threadDelay envTimeout)
     case eresp of
