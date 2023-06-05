@@ -247,7 +247,7 @@ connectCluster bootstrapConnInfo = do
 
       clusterConnect :: Bool -> IO Cluster.Connection -> IO Cluster.Connection
       clusterConnect readOnlyConnection connection = do
-          clusterConn@(Cluster.Connection nodeMapVar _ _ _ _ _) <- connection
+          clusterConn@(Cluster.Connection nodeMapVar _ _ _ _) <- connection
           nodeMap <- readMVar nodeMapVar
           let nodeList = HM.toList nodeMap
           maybeConns <- sequence $ (ctxToConn . snd) <$> nodeList
@@ -311,7 +311,7 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
 refreshShardMap :: Cluster.Connection -> IO ShardMap
-refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
+refreshShardMap (Cluster.Connection nodeConnsVar shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
     putStrLn "ShardMap Refreshed."
     maybeShardMap <- tryTakeMVar shardMapVar
     case maybeShardMap of
