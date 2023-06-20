@@ -9,7 +9,7 @@ import Control.Exception
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
-import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar_, tryTakeMVar, putMVar)
+import Control.Concurrent.MVar(MVar, newMVar, readMVar, tryTakeMVar, putMVar)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
@@ -22,7 +22,7 @@ import qualified Network.Socket as NS
 import qualified Data.HashMap.Strict as HM
 import System.Random (randomRIO)
 import System.Environment (lookupEnv)
-import Data.Maybe (fromMaybe, catMaybes)
+import Data.Maybe (fromMaybe)
 import Text.Read (readMaybe)
 
 import qualified Database.Redis.ProtocolPipelining as PP
@@ -42,7 +42,6 @@ import Database.Redis.Commands
     , auth
     , clusterSlots
     , command
-    , readOnly
     , ClusterSlotsResponse(..)
     , ClusterSlotsResponseEntry(..)
     , ClusterSlotsNode(..))
@@ -236,39 +235,8 @@ connectCluster bootstrapConnInfo = do
                 }
                 withAuth = tcpConnWithAuth connectAuth' connectTLSParams'
                 clusterConnection = Cluster.connect withAuth infos shardMapVar isConnectionReadOnly refreshShardMapWithNodeConn tcpInfo
-            -- pool <- createPool (clusterConnect isConnectionReadOnly clusterConnection) Cluster.disconnect 3 (connectMaxIdleTime bootstrapConnInfo) (connectMaxConnections bootstrapConnInfo)
-            connection <- clusterConnect isConnectionReadOnly clusterConnection
+            connection <- clusterConnection
             return $ ClusteredConnection shardMapVar connection
-    where
-
-      clusterConnect :: Bool -> IO Cluster.Connection -> IO Cluster.Connection
-      clusterConnect readOnlyConnection connection = do
-          clusterConn@(Cluster.Connection nodeMapVar _ _ _ _) <- connection
-          nodeMap <- readMVar nodeMapVar
-          let nodeList = HM.toList nodeMap
-          maybeConns <- sequence $ (ctxToConn . snd) <$> nodeList
-          let nodeConnsPair = zip maybeConns nodeList
-          workingNodes <- mapM (\(maybeConn, nodeConn) -> case maybeConn of
-                    Just conn -> do
-                        when readOnlyConnection $ do
-                            PP.beginReceiving conn
-                            runRedisInternal conn readOnly >> return ()
-                        return $ Just nodeConn
-                    Nothing -> return Nothing
-                ) nodeConnsPair
-          let newMap = HM.fromList $ catMaybes workingNodes
-          _ <- modifyMVar_ nodeMapVar (\_ -> return newMap)
-          return clusterConn
-          where
-          ctxToConn :: Cluster.NodeConnection -> IO (Maybe PP.Connection)
-          ctxToConn (Cluster.NodeConnection pool nid) = do
-            maybeConn <- try $ withResource pool (\(Cluster.NodeResource (ctx, _)) -> PP.fromCtx ctx)
-            case maybeConn of
-                Right ppConn -> return $ Just ppConn
-                Left (_ :: SomeException) -> do
-                    putStrLn ("SomeException Occured in NodeID " ++ show nid)
-                    return Nothing
-
 
 tcpConnWithAuth :: Maybe B.ByteString -> Maybe ClientParams -> Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
 tcpConnWithAuth connectAuth connectTLSParams host port timeout = do
