@@ -284,7 +284,7 @@ rawResponse (CompletedRequest _ _ r) = r
 -- cluster reconfiguration events, which should be rare.
 evaluatePipeline :: MVar ShardMap -> IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
 evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
-        shardMap <- readMVar shardMapVar
+        shardMap <- hasLocked $ readMVar shardMapVar
         erequestsByNode <- try $ getRequestsByNode shardMap
         requestsByNode <- case erequestsByNode of
             Right reqByNode-> pure reqByNode

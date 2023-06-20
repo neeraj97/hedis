@@ -128,9 +128,6 @@ defaultConnectInfo = ConnInfo
     , connectTLSParams      = Nothing
     }
 
-shardMapRefreshDelta :: Time.NominalDiffTime
-shardMapRefreshDelta = Time.secondsToNominalDiffTime 60
-
 createConnection :: ConnectInfo -> IO PP.Connection
 createConnection ConnInfo{..} = do
     let timeoutOptUs =
@@ -261,7 +258,7 @@ connectCluster bootstrapConnInfo = do
                     Nothing -> return Nothing
                 ) nodeConnsPair
           let newMap = HM.fromList $ catMaybes workingNodes
-          _ <- forkIO $ modifyMVar_ nodeMapVar (\_ -> return newMap)
+          _ <- modifyMVar_ nodeMapVar (\_ -> return newMap)
           return clusterConn
           where
           ctxToConn :: Cluster.NodeConnection -> IO (Maybe PP.Connection)
