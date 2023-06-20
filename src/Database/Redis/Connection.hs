@@ -10,7 +10,6 @@ import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar_, tryTakeMVar, putMVar)
-import Control.Concurrent(forkIO)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
