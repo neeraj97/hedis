@@ -283,7 +283,7 @@ refreshShardMapWithNodeConn nodeConnsList = do
     selectedIdx <- randomRIO (0, (length nodeConnsList) - 1)
     let (Cluster.NodeConnection ctx _ _) = nodeConnsList !! selectedIdx
     pipelineConn <- PP.fromCtx ctx
-    envTimeout <- fromMaybe (10 ^ (3 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
+    envTimeout <- fromMaybe (10 ^ (5 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
     raceResult <- T.timeout envTimeout (try $ refreshShardMapWithConn pipelineConn True)-- racing with delay of default 1 ms 
     case raceResult of
         Nothing -> do
