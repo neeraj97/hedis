@@ -10,7 +10,7 @@ import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
 import Control.Concurrent(forkIO)
-import Control.Concurrent.MVar(MVar, newMVar, putMVar, readMVar, modifyMVar_)
+import Control.Concurrent.MVar(MVar, newMVar, putMVar, readMVar, modifyMVar_, tryTakeMVar)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
@@ -310,23 +310,24 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
 refreshShardMap :: Cluster.Connection -> IO ShardMap
-refreshShardMap (Cluster.Connection nodeConnsVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
-    nodeConns <- readMVar nodeConnsVar
+refreshShardMap (Cluster.Connection nodeConnMapVar _ shardMapVar _ _ Cluster.TcpInfo { idleTime, maxResources, timeoutOpt, connectAuth, connectTLSParams }) = do
+    nodeConns <- readMVar nodeConnMapVar
     newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
-    modifyMVar_ nodeConnsVar $ \oldMap -> do
+    _ <- liftIO $ tryTakeMVar shardMapVar
+    modifyMVar_ nodeConnMapVar $ \oldNodeConnMap -> do
         putMVar shardMapVar newShardMap
-        updateNodeConnections newShardMap oldMap
+        updateNodeConnections newShardMap oldNodeConnMap
     return newShardMap
     where
         withAuth :: Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
         withAuth = tcpConnWithAuth connectAuth connectTLSParams
         updateNodeConnections :: ShardMap -> HM.HashMap Cluster.NodeID Cluster.NodeConnection -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
-        updateNodeConnections shardMap oldMap =
-            connectAndAppend oldMap $ filter ((`HM.member` oldMap) . (\(Cluster.Node n _ _ _) -> n)) (nub $ Cluster.nodes shardMap)
+        updateNodeConnections newShardMap oldNodeConnMap = do
+            connectAndAppend oldNodeConnMap $ filter (not . (`HM.member` oldNodeConnMap) . (\(Cluster.Node n _ _ _) -> n)) (nub $ Cluster.nodes newShardMap)
         connectAndAppend :: HM.HashMap Cluster.NodeID Cluster.NodeConnection -> [Cluster.Node] -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
-        connectAndAppend oldMap nodes = do
-            conns <- mapM connectNode nodes
-            return $ foldl (\acc (k, v) -> HM.insert k v acc) oldMap conns
+        connectAndAppend oldNodeConnMap newNodes = do
+            conns <- mapM connectNode newNodes
+            return $ foldl (\acc (k, v) -> HM.insert k v acc) oldNodeConnMap conns
         connectNode :: Cluster.Node -> IO (Cluster.NodeID, Cluster.NodeConnection)
         connectNode (Cluster.Node n _ host port) = do
             ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
@@ -340,7 +341,7 @@ refreshShardMapWithNodeConn nodeConnsList = do
     let (Cluster.NodeConnection pool _ _) = nodeConnsList !! selectedIdx
     withResource pool $ \ctx -> do
         pipelineConn <- PP.fromCtx ctx
-        envTimeout <- fromMaybe (10 ^ (3 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
+        envTimeout <- fromMaybe (10 ^ (5 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
         raceResult <- race (threadDelay envTimeout) (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 1 ms 
         case raceResult of
             Left () -> do

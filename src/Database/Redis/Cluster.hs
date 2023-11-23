@@ -37,7 +37,7 @@ import Data.Pool(Pool, createPool, withResource, destroyAllResources)
 import Control.Concurrent.Async(race)
 import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
-import Control.Monad(zipWithM, when, replicateM)
+import Control.Monad(zipWithM, when, replicateM, void)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
 import qualified Database.Redis.ConnectionContext as CC
 import qualified Data.HashMap.Strict as HM
@@ -313,7 +313,7 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         retryReply <- head <$> retryBatch shardMapVar refreshShardmapAction conn retryCount [request] [thisReply]
         return (CompletedRequest index request retryReply)
     refreshShardMapVar :: IO ()
-    refreshShardMapVar = hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
+    refreshShardMapVar = void $ hasLocked $ refreshShardmapAction
 
 -- Retry a batch of requests if any of the responses is a redirect instruction.
 -- If multiple requests are passed in they're assumed to be a MULTI..EXEC
@@ -336,7 +336,7 @@ retryBatch shardMapVar refreshShardmapAction conn retryCount requests replies =
                 Just askNode -> tail <$> requestNode askNode (["ASKING"] : requests)
                 Nothing -> case retryCount of
                     0 -> do
-                        _ <- hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
+                        _ <- hasLocked $ refreshShardmapAction
                         retryBatch shardMapVar refreshShardmapAction conn (retryCount + 1) requests replies
                     _ -> throwIO $ MissingNodeException (head requests)
         _ -> return replies
@@ -392,7 +392,7 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
     -- often to retry, so instead we'll propagate the error to the library user
     -- and let them decide how they would like to handle the error.
     when (any moved resps)
-      (hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction))
+      (void $ hasLocked $ refreshShardmapAction)
     retriedResps <- retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
     return retriedResps
 
