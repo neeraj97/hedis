@@ -327,7 +327,7 @@ retryBatch shardMapVar refreshShardmapAction conn retryCount requests replies =
             let (Connection _ _ _ infoMap _ _) = conn
             keys <- mconcat <$> mapM (requestKeys infoMap) requests
             hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
-            nodeConn <- nodeConnForHashSlot shardMapVar conn (MissingNodeException (head requests)) hashSlot
+            nodeConn <- nodeConnForHashSlot shardMapVar conn refreshShardmapAction (MissingNodeException (head requests)) hashSlot
             requestNode nodeConn requests
         (askingRedirection -> Just (host, port)) -> do
             shardMap <- hasLocked $ readMVar shardMapVar
@@ -357,7 +357,7 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
     -- the commands in a transaction are applied and some are not. Better to
     -- fail early.
     hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
-    nodeConn <- nodeConnForHashSlot shardMapVar conn (MissingNodeException (head requests)) hashSlot
+    nodeConn <- nodeConnForHashSlot shardMapVar conn refreshShardmapAction (MissingNodeException (head requests)) hashSlot
     -- catch the exception thrown, send the command to random node.
     -- This change is required to handle the cluster topology change.
     eresps <- try $ requestNode nodeConn requests
@@ -396,8 +396,8 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
     retriedResps <- retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
     return retriedResps
 
-nodeConnForHashSlot :: Exception e => MVar ShardMap -> Connection -> e -> HashSlot -> IO NodeConnection
-nodeConnForHashSlot shardMapVar conn exception hashSlot = do
+nodeConnForHashSlot :: Exception e => MVar ShardMap -> Connection -> IO ShardMap -> e -> HashSlot -> IO NodeConnection
+nodeConnForHashSlot shardMapVar conn refreshShardmapAction exception hashSlot = do
     let (Connection nodeConnsVar _ _ _ _ _) = conn
     (ShardMap shardMap) <- hasLocked $ readMVar shardMapVar
     nodeConns <- readMVar nodeConnsVar
@@ -406,7 +406,9 @@ nodeConnForHashSlot shardMapVar conn exception hashSlot = do
             Nothing -> throwIO exception
             Just (Shard master _) -> return master
     case HM.lookup (nodeId node) nodeConns of
-        Nothing -> throwIO exception
+        Nothing -> do
+            void $ hasLocked $ refreshShardmapAction
+            throwIO exception
         Just nodeConn' -> return nodeConn'
 
 hashSlotForKeys :: Exception e => e -> [B.ByteString] -> IO HashSlot
