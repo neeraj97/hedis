@@ -9,13 +9,14 @@ import Control.Exception
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when)
-import Control.Concurrent.MVar(MVar, newMVar)
+import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar_)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Pool(Pool, withResource, createPool, destroyAllResources)
 import Data.Typeable
+import Data.List (nub)
 import qualified Data.Time as Time
 import Network.TLS (ClientParams)
 import qualified Network.Socket as NS
@@ -28,10 +29,9 @@ import Text.Read (readMaybe)
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Core(Redis, runRedisInternal, runRedisClusteredInternal)
 import Database.Redis.Protocol(Reply(..))
-import Database.Redis.Cluster(ShardMap(..), Node, Shard(..))
+import Database.Redis.Cluster(ShardMap(..), Node(..), Shard(..), NodeID, NodeConnection)
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
---import qualified Database.Redis.Cluster.Pipeline as ClusterPipeline
 
 import Database.Redis.Commands
     ( ping
@@ -53,7 +53,7 @@ import qualified System.Timeout as T
 --  'connect' function to create one.
 data Connection
     = NonClusteredConnection (Pool PP.Connection)
-    | ClusteredConnection (MVar ShardMap) (Pool Cluster.Connection)
+    | ClusteredConnection (MVar ShardMap) (Pool Cluster.Connection) ConnectInfo
 
 -- |Information for connnecting to a Redis server.
 --
@@ -125,6 +125,19 @@ defaultConnectInfo = ConnInfo
     , connectTLSParams      = Nothing
     }
 
+defaultClusterConnectInfo :: ConnectInfo
+defaultClusterConnectInfo = ConnInfo
+    { connectHost           = "localhost"
+    , connectPort           = CC.PortNumber 30001
+    , connectAuth           = Nothing
+    , connectReadOnly       = False
+    , connectDatabase       = 0
+    , connectMaxConnections = 50
+    , connectMaxIdleTime    = 30
+    , connectTimeout        = Nothing
+    , connectTLSParams      = Nothing
+    }
+
 createConnection :: ConnectInfo -> IO PP.Connection
 createConnection ConnInfo{..} = do
     let timeoutOptUs =
@@ -172,7 +185,7 @@ checkedConnect connInfo = do
 -- |Destroy all idle resources in the pool.
 disconnect :: Connection -> IO ()
 disconnect (NonClusteredConnection pool) = destroyAllResources pool
-disconnect (ClusteredConnection _ pool) = destroyAllResources pool
+disconnect (ClusteredConnection _ pool _) = destroyAllResources pool
 
 -- | Memory bracket around 'connect' and 'disconnect'.
 withConnect :: (Catch.MonadMask m, MonadIO m) => ConnectInfo -> (Connection -> m c) -> m c
@@ -190,8 +203,8 @@ withCheckedConnect connInfo = bracket (checkedConnect connInfo) disconnect
 runRedis :: Connection -> Redis a -> IO a
 runRedis (NonClusteredConnection pool) redis =
   withResource pool $ \conn -> runRedisInternal conn redis
-runRedis (ClusteredConnection _ pool) redis =
-    withResource pool $ \conn -> runRedisClusteredInternal conn (refreshShardMap conn) redis
+runRedis (ClusteredConnection _ pool bootstrapConnInfo) redis =
+    withResource pool $ \conn -> runRedisClusteredInternal conn (refreshShardMap conn bootstrapConnInfo) redis
 
 newtype ClusterConnectError = ClusterConnectError Reply
     deriving (Eq, Show, Typeable)
@@ -208,8 +221,6 @@ instance Exception ClusterConnectError
 -- - PUBLISH, SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, RESET
 connectCluster :: ConnectInfo -> IO Connection
 connectCluster bootstrapConnInfo = do
-    let timeoutOptUs =
-          round . (1000000 *) <$> connectTimeout bootstrapConnInfo
     conn <- createConnection bootstrapConnInfo
     slotsResponse <- runRedisInternal conn clusterSlots
     shardMapVar <- case slotsResponse of
@@ -223,31 +234,14 @@ connectCluster bootstrapConnInfo = do
         Right infos -> do
             let
                 isConnectionReadOnly = connectReadOnly bootstrapConnInfo
-                clusterConnection = Cluster.connect withAuth infos shardMapVar timeoutOptUs isConnectionReadOnly refreshShardMapWithNodeConn
+                clusterConnection = Cluster.connect (connectWithAuth bootstrapConnInfo) infos shardMapVar (clusterConnectTimeoutinUs bootstrapConnInfo) isConnectionReadOnly refreshShardMapWithNodeConn
             pool <- createPool (clusterConnect isConnectionReadOnly clusterConnection) Cluster.disconnect 1 (connectMaxIdleTime bootstrapConnInfo) (connectMaxConnections bootstrapConnInfo)
-            return $ ClusteredConnection shardMapVar pool
+            return $ ClusteredConnection shardMapVar pool bootstrapConnInfo
     where
-      withAuth host port timeout = do
-        conn <- PP.connect host port timeout
-        conn' <- case connectTLSParams bootstrapConnInfo of
-                  Nothing -> return conn
-                  Just tlsParams -> PP.enableTLS tlsParams conn
-        PP.beginReceiving conn'
-
-        runRedisInternal conn' $ do
-            -- AUTH
-            case connectAuth bootstrapConnInfo of
-                Nothing   -> return ()
-                Just pass -> do
-                  resp <- auth pass
-                  case resp of
-                    Left r -> liftIO $ throwIO $ ConnectAuthError r
-                    _      -> return ()
-        return $ PP.toCtx conn'
-
       clusterConnect :: Bool -> IO Cluster.Connection -> IO Cluster.Connection
       clusterConnect readOnlyConnection connection = do
-          clusterConn@(Cluster.Connection nodeMap _ _ _ _) <- connection
+          clusterConn@(Cluster.Connection nodeMapMvar _ _ _ _) <- connection
+          nodeMap <- Cluster.hasLocked $ readMVar nodeMapMvar
           nodesConns <-  sequence $ ( PP.fromCtx . (\(Cluster.NodeConnection ctx _ _) -> ctx ) . snd) <$> (HM.toList nodeMap)
           when readOnlyConnection $
                   mapM_ (\conn -> do
@@ -255,6 +249,10 @@ connectCluster bootstrapConnInfo = do
                           runRedisInternal conn readOnly
                       ) nodesConns
           return clusterConn
+
+clusterConnectTimeoutinUs :: ConnectInfo -> Maybe Int
+clusterConnectTimeoutinUs bootstrapConnInfo =  
+    round . (1000000 *) <$> connectTimeout bootstrapConnInfo
 
 shardMapFromClusterSlotsResponse :: ClusterSlotsResponse -> IO ShardMap
 shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries where
@@ -273,9 +271,40 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
         in
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
-refreshShardMap :: Cluster.Connection -> IO ShardMap
-refreshShardMap (Cluster.Connection nodeConns _ _ _ _) =
-    refreshShardMapWithNodeConn (HM.elems nodeConns)
+refreshShardMap :: Cluster.Connection -> ConnectInfo -> IO ShardMap
+refreshShardMap (Cluster.Connection nodeConnsMvar _ _ _ _) bootstrapConnInfo = do 
+    nodeConns <- Cluster.hasLocked $ readMVar nodeConnsMvar
+    updatedShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
+    updatedConn <- getConnectionsMapFromShardMap updatedShardMap bootstrapConnInfo
+    Cluster.hasLocked $ modifyMVar_ nodeConnsMvar (const (pure updatedConn))
+    pure updatedShardMap
+
+getConnectionsMapFromShardMap :: ShardMap -> ConnectInfo -> IO (HM.HashMap NodeID NodeConnection)
+getConnectionsMapFromShardMap shardMap bootstrapConnInfo = do
+    let nodes = nub $ Cluster.nodes shardMap
+        connectNodeWithAuth = Cluster.connectNode (connectWithAuth bootstrapConnInfo) (clusterConnectTimeoutinUs bootstrapConnInfo)
+    connRes <- mapM (\node ->
+        connectNodeWithAuth node `catch` (\(err :: SomeException) -> throwIO (Cluster.RefreshNodesException $ show err))) nodes
+    return $ foldl (\acc (v, nc) -> HM.insert v nc acc) mempty connRes
+
+connectWithAuth ::  ConnectInfo -> Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext
+connectWithAuth bootstrapConnInfo host port timeout = do
+    conn <- PP.connect host port timeout
+    conn' <- case connectTLSParams bootstrapConnInfo of
+            Nothing -> return conn
+            Just tlsParams -> PP.enableTLS tlsParams conn
+    PP.beginReceiving conn'
+
+    runRedisInternal conn' $ do  
+        -- AUTH
+        case connectAuth bootstrapConnInfo of
+            Nothing   -> return ()
+            Just pass -> do
+                resp <- auth pass
+                case resp of
+                    Left r -> liftIO $ throwIO $ ConnectAuthError r
+                    _      -> return ()
+    return $ PP.toCtx conn'
 
 refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
 refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
