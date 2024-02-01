@@ -307,23 +307,37 @@ connectWithAuth bootstrapConnInfo host port timeout = do
     return $ PP.toCtx conn'
 
 refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
-refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
-refreshShardMapWithNodeConn nodeConnsList = do
-    selectedIdx <- randomRIO (0, (length nodeConnsList) - 1)
-    let (Cluster.NodeConnection ctx _ _) = nodeConnsList !! selectedIdx
-    pipelineConn <- PP.fromCtx ctx
-    envTimeout <- fromMaybe (10 ^ (5 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
-    raceResult <- T.timeout envTimeout (try $ refreshShardMapWithConn pipelineConn True)-- racing with delay of default 1 ms 
-    case raceResult of
-        Nothing -> do
-            print $ "TimeoutForConnection " <> show ctx 
-            throwIO $ Cluster.TimeoutException "ClusterSlots Timeout"
-        Just eiShardMapResp -> 
-            case eiShardMapResp of
-                Right shardMap -> pure shardMap 
-                Left (err :: SomeException) -> do
-                    print $ "ShardMapRefreshError-" <> show err 
-                    throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+refreshShardMapWithNodeConn nodeConnsList' = do
+    refreshRetries <- fromMaybe 2 . (>>= readMaybe) <$> lookupEnv "REFRESH_SHARD_MAP_RETRIES"
+    refreshShardMapWithNodeConn' nodeConnsList' [] "" (min refreshRetries (length nodeConnsList' - 1))
+
+    where
+        refreshShardMapWithNodeConn' [] _ _ _ = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+        refreshShardMapWithNodeConn' nodeConnsList excludedConnIdxs prevErrors retriesLeft = do
+            selectedIdx <- getUniqueRandom (length nodeConnsList) excludedConnIdxs
+            let (Cluster.NodeConnection ctx _ _) = nodeConnsList !! selectedIdx
+            pipelineConn <- PP.fromCtx ctx
+            envTimeout <- fromMaybe (10 ^ (5 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
+            raceResult <- T.timeout envTimeout (try $ refreshShardMapWithConn pipelineConn True)-- racing with delay of default 1 ms 
+            case raceResult of
+                Nothing -> do
+                    when (retriesLeft < 1) $ throwIO $ Cluster.TimeoutException ("ClusterSlots Timeout. " <> "Prev errors: " <> show prevErrors)
+                    refreshShardMapWithNodeConn' nodeConnsList (selectedIdx : excludedConnIdxs) ("ClusterSlots Timeout. " <> prevErrors) (retriesLeft - 1)
+                Just eiShardMapResp ->
+                    case eiShardMapResp of
+                        Right shardMap -> pure shardMap
+                        Left (err :: SomeException) -> do
+                            when (retriesLeft < 1) $ throwIO $ ClusterConnectError (Error $ "Couldn't refresh shardMap due to error: " <>  Char8.pack (show err <> " Prev errors: " <> show prevErrors))
+                            refreshShardMapWithNodeConn' nodeConnsList (selectedIdx : excludedConnIdxs) (show err <> ". " <> prevErrors) (retriesLeft - 1)
+
+        getUniqueRandom nodeConnsLength excludedConnIdxs = do
+            if nodeConnsLength <= length excludedConnIdxs
+                then pure 0
+            else do
+                selectedIdx <- randomRIO (0, nodeConnsLength - 1)
+                if selectedIdx `elem` excludedConnIdxs
+                    then getUniqueRandom nodeConnsLength excludedConnIdxs
+                    else pure $ selectedIdx
 
 refreshShardMapWithConn :: PP.Connection -> Bool -> IO ShardMap
 refreshShardMapWithConn pipelineConn _ = do

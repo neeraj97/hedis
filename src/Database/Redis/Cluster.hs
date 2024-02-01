@@ -46,7 +46,7 @@ import System.Environment (lookupEnv)
 import System.IO.Unsafe(unsafeInterleaveIO)
 import Text.Read (readMaybe)
 
-import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
+import Database.Redis.Protocol(Reply(Error, SingleLine), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
 import System.Timeout (timeout)
 
@@ -390,8 +390,21 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
     -- and let them decide how they would like to handle the error.
     when (any moved resps)
       (hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction))
-    retriedResps <- retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
-    return retriedResps
+
+    if isMultiExecMoved resps
+        then (\nc -> requestNode nc requests) =<< nodeConnForHashSlot shardMapVar conn (MissingNodeException (head requests)) hashSlot
+        else retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
+    where
+
+        isMultiExecMoved :: [Reply] -> Bool
+        isMultiExecMoved [] = False
+        isMultiExecMoved (reply' : replies) = do
+            reply' == SingleLine "OK" && go replies
+            where
+                go []       = False
+                go [r]      = isExecAbort r
+                go (r : rs) = moved r && go rs
+
 
 nodeConnForHashSlot :: Exception e => MVar ShardMap -> Connection -> e -> HashSlot -> IO NodeConnection
 nodeConnForHashSlot shardMapVar conn exception hashSlot = do
@@ -437,6 +450,11 @@ moved (Error errString) = case Char8.words errString of
     _ -> False
 moved _ = False
 
+isExecAbort :: Reply -> Bool
+isExecAbort (Error errString) = case Char8.words errString of
+    "EXECABORT":_ -> True
+    _ -> False
+isExecAbort _ = False
 
 nodeConnWithHostAndPort :: ShardMap -> Connection -> Host -> Port -> IO (Maybe NodeConnection)
 nodeConnWithHostAndPort shardMap (Connection nodeConnsMvar _ _ _ _) host port = do
