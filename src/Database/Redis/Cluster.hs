@@ -46,7 +46,7 @@ import System.Environment (lookupEnv)
 import System.IO.Unsafe(unsafeInterleaveIO)
 import Text.Read (readMaybe)
 
-import Database.Redis.Protocol(Reply(Error, SingleLine), renderRequest, reply)
+import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
 import System.Timeout (timeout)
 
@@ -318,7 +318,7 @@ retryBatch shardMapVar refreshShardmapAction conn retryCount requests replies =
     -- The last reply will be the `EXEC` reply containing the redirection, if
     -- there is one.
     case last replies of
-        (Error errString) | B.isPrefixOf "MOVED" errString -> do
+        (Error errString) | B.isPrefixOf "MOVED" errString || B.isPrefixOf "EXECABORT" errString -> do
             let (Connection _ _ _ infoMap _) = conn
             keys <- mconcat <$> mapM (requestKeys infoMap) requests
             hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
@@ -391,19 +391,7 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
     when (any moved resps)
       (hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction))
 
-    if isMultiExecMoved resps
-        then (\nc -> requestNode nc requests) =<< nodeConnForHashSlot shardMapVar conn (MissingNodeException (head requests)) hashSlot
-        else retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
-    where
-
-        isMultiExecMoved :: [Reply] -> Bool
-        isMultiExecMoved [] = False
-        isMultiExecMoved (reply' : replies) = do
-            reply' == SingleLine "OK" && go replies
-            where
-                go []       = False
-                go [r]      = isExecAbort r
-                go (r : rs) = moved r && go rs
+    retryBatch shardMapVar refreshShardmapAction conn 0 requests resps
 
 
 nodeConnForHashSlot :: Exception e => MVar ShardMap -> Connection -> e -> HashSlot -> IO NodeConnection
@@ -449,12 +437,6 @@ moved (Error errString) = case Char8.words errString of
     "MOVED":_ -> True
     _ -> False
 moved _ = False
-
-isExecAbort :: Reply -> Bool
-isExecAbort (Error errString) = case Char8.words errString of
-    "EXECABORT":_ -> True
-    _ -> False
-isExecAbort _ = False
 
 nodeConnWithHostAndPort :: ShardMap -> Connection -> Host -> Port -> IO (Maybe NodeConnection)
 nodeConnWithHostAndPort shardMap (Connection nodeConnsMvar _ _ _ _) host port = do
