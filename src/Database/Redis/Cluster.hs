@@ -18,11 +18,14 @@ module Database.Redis.Cluster
   , TcpInfo(..)
   , Host
   , NodeID
+  , Pipeline(..)
+  , PipelineState(..)
   , connect
   , destroyNodeResources
   , requestPipelined
   , requestMasterNodes
   , nodes
+  , connectNode
 ) where
 
 import qualified Data.ByteString as B
@@ -66,7 +69,7 @@ import Network.TLS (ClientParams)
 -- | 'NodeConnection's, a 'Pipeline', and a 'ShardMap'
 type IsReadOnly = Bool
 
-data Connection = Connection (MVar NodeConnectionMap) (MVar Pipeline) (MVar ShardMap) CMD.InfoMap IsReadOnly TcpInfo
+data Connection = Connection (MVar NodeConnectionMap) (MVar ShardMap) CMD.InfoMap IsReadOnly TcpInfo
 
 -- | A connection to a single node in the cluster, similar to 'ProtocolPipelining.Connection'
 data NodeConnection = NodeConnection (Pool CC.ConnectionContext) (IOR.IORef (Maybe B.ByteString)) NodeID
@@ -147,10 +150,8 @@ data TimeoutException = TimeoutException String deriving (Show, Typeable)
 instance Exception TimeoutException
 
 connect :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> [CMD.CommandInfo] -> MVar ShardMap -> Bool -> ([NodeConnection] -> IO ShardMap) -> TcpInfo -> IO Connection
-connect withAuth commandInfos shardMapVar isReadOnly refreshShardMap (tcpInfo@TcpInfo{ timeoutOpt, maxResources, idleTime }) = do
+connect withAuth commandInfos shardMapVar isReadOnly refreshShardMap tcpInfo = do
         shardMap <- readMVar shardMapVar
-        stateVar <- newMVar $ Pending []
-        pipelineVar <- newMVar $ Pipeline stateVar
         (eNodeConns, shouldRetry) <- nodeConnections shardMap
         -- whenever one of the node connection is not established,
         -- will refresh the slots and retry node connections.
@@ -167,34 +168,35 @@ connect withAuth commandInfos shardMapVar isReadOnly refreshShardMap (tcpInfo@Tc
             else
               return eNodeConns
         nodeConnsVar <- newMVar nodeConns
-        return $ Connection nodeConnsVar pipelineVar shardMapVar (CMD.newInfoMap commandInfos) isReadOnly tcpInfo where
+        return $ Connection nodeConnsVar shardMapVar (CMD.newInfoMap commandInfos) isReadOnly tcpInfo where
     simpleNodeConnections :: ShardMap -> IO (HM.HashMap NodeID NodeConnection)
-    simpleNodeConnections shardMap = HM.fromList <$> mapM connectNode (nub $ nodes shardMap)
+    simpleNodeConnections shardMap = HM.fromList <$> mapM (connectNode withAuth tcpInfo) (nub $ nodes shardMap)
     nodeConnections :: ShardMap -> IO (HM.HashMap NodeID NodeConnection, Bool)
     nodeConnections shardMap = do
-      info <- mapM (try . connectNode) (nub $ nodes shardMap)
+      info <- mapM (try . (connectNode withAuth tcpInfo)) (nub $ nodes shardMap)
       return $
         foldl (\(acc, accB) x -> case x of
                     Right (v, nc) -> (HM.insert v nc acc, accB)
                     Left (_ :: SomeException) -> (acc, True)
            ) (mempty, False) info
-    connectNode :: Node -> IO (NodeID, NodeConnection)
-    connectNode (Node n _ host port) = do
-        ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
-        ref <- IOR.newIORef Nothing
-        return (n, NodeConnection ctx ref n)
     refreshShardMapVar :: ShardMap -> IO ()
     refreshShardMapVar shardMap = hasLocked $ modifyMVar_ shardMapVar (const (pure shardMap))
 
+connectNode :: (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> TcpInfo -> Node -> IO (NodeID, NodeConnection)
+connectNode withAuth (TcpInfo{ timeoutOpt, maxResources, idleTime }) (Node n _ host port) = do
+    ctx <- createPool (withAuth host (CC.PortNumber $ toEnum port) timeoutOpt) CC.disconnect 1 idleTime maxResources
+    ref <- IOR.newIORef Nothing
+    return (n, NodeConnection ctx ref n)
+
 destroyNodeResources :: Connection -> IO ()
-destroyNodeResources (Connection nodeConnMapVar _ _ _ _ _) = readMVar nodeConnMapVar >>= (mapM_ disconnectNode . HM.elems) where
+destroyNodeResources (Connection nodeConnMapVar _ _ _ _) = readMVar nodeConnMapVar >>= (mapM_ disconnectNode . HM.elems) where
     disconnectNode (NodeConnection nodePool _ _) = destroyAllResources nodePool
 
 -- Add a request to the current pipeline for this connection. The pipeline will
 -- be executed implicitly as soon as any result returned from this function is
 -- evaluated.
-requestPipelined :: IO ShardMap -> Connection -> [B.ByteString] -> IO Reply
-requestPipelined refreshShardmapAction conn@(Connection _ pipelineVar shardMapVar _ _ _) nextRequest = modifyMVar pipelineVar $ \(Pipeline stateVar) -> do
+requestPipelined :: IO ShardMap -> Connection -> [B.ByteString] -> MVar Pipeline -> IO Reply
+requestPipelined refreshShardmapAction conn@(Connection _ shardMapVar _ _ _) nextRequest pipelineVar = modifyMVar pipelineVar $ \(Pipeline stateVar) -> do
     (newStateVar, repliesIndex) <- hasLocked $ modifyMVar stateVar $ \case
         Pending requests | isMulti nextRequest -> do
             replies <- evaluatePipeline shardMapVar refreshShardmapAction conn requests
@@ -324,7 +326,7 @@ retryBatch shardMapVar refreshShardmapAction conn retryCount requests replies =
     -- there is one.
     case last replies of
         (Error errString) | B.isPrefixOf "MOVED" errString -> do
-            let (Connection _ _ _ infoMap _ _) = conn
+            let (Connection _ _ infoMap _ _) = conn
             keys <- mconcat <$> mapM (requestKeys infoMap) requests
             hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
             nodeConn <- nodeConnForHashSlot shardMapVar conn refreshShardmapAction (MissingNodeException (head requests)) hashSlot
@@ -346,7 +348,7 @@ retryBatch shardMapVar refreshShardmapAction conn retryCount requests replies =
 evaluateTransactionPipeline :: MVar ShardMap -> IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
 evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = do
     let requests = reverse requests'
-    let (Connection _ _ _ infoMap _ _) = conn
+    let (Connection _ _ infoMap _ _) = conn
     keys <- mconcat <$> mapM (requestKeys infoMap) requests
     -- In cluster mode Redis expects commands in transactions to all work on the
     -- same hashslot. We find that hashslot here.
@@ -398,7 +400,7 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' = d
 
 nodeConnForHashSlot :: Exception e => MVar ShardMap -> Connection -> IO ShardMap -> e -> HashSlot -> IO NodeConnection
 nodeConnForHashSlot shardMapVar conn refreshShardmapAction exception hashSlot = do
-    let (Connection nodeConnsVar _ _ _ _ _) = conn
+    let (Connection nodeConnsVar _ _ _ _) = conn
     (ShardMap shardMap) <- hasLocked $ readMVar shardMapVar
     nodeConns <- readMVar nodeConnsVar
     node <-
@@ -444,7 +446,7 @@ moved _ = False
 
 
 nodeConnWithHostAndPort :: ShardMap -> Connection -> Host -> Port -> IO (Maybe NodeConnection)
-nodeConnWithHostAndPort shardMap (Connection nodeConnsVar _ _ _ _ _) host port =
+nodeConnWithHostAndPort shardMap (Connection nodeConnsVar _ _ _ _) host port =
     case nodeWithHostAndPort shardMap host port of
         Nothing -> return Nothing
         Just node -> do
@@ -452,7 +454,7 @@ nodeConnWithHostAndPort shardMap (Connection nodeConnsVar _ _ _ _ _) host port =
             return (HM.lookup (nodeId node) nodeConns)
 
 nodeConnectionForCommand :: Connection -> ShardMap -> [B.ByteString] -> IO [NodeConnection]
-nodeConnectionForCommand conn@(Connection nodeConnsVar _ _ infoMap _ _) (ShardMap shardMap) request =
+nodeConnectionForCommand conn@(Connection nodeConnsVar _ infoMap _ _) (ShardMap shardMap) request =
     case request of
         ("FLUSHALL" : _) -> allNodes
         ("FLUSHDB" : _) -> allNodes
@@ -474,7 +476,7 @@ nodeConnectionForCommand conn@(Connection nodeConnsVar _ _ infoMap _ _) (ShardMa
                 Just allNodes' -> return allNodes'
 
 allMasterNodes :: Connection -> ShardMap -> IO (Maybe [NodeConnection])
-allMasterNodes (Connection nodeConnsVar _ _ _ _ _) (ShardMap shardMap) = do
+allMasterNodes (Connection nodeConnsVar _ _ _ _) (ShardMap shardMap) = do
     nodeConns <- readMVar nodeConnsVar
     return $ mapM (flip HM.lookup nodeConns . nodeId) onlyMasterNodes
   where
@@ -535,7 +537,7 @@ requestMasterNodes conn req = do
     concat <$> mapM (`requestNode` [req]) masterNodeConns
 
 masterNodes :: Connection -> IO [NodeConnection]
-masterNodes (Connection nodeConnsVar _ shardMapVar _ _ _) = do
+masterNodes (Connection nodeConnsVar shardMapVar _ _ _) = do
     (ShardMap shardMap) <- readMVar shardMapVar
     let masters = map ((\(Shard m _) -> m) . snd) $ IntMap.toList shardMap
     let masterNodeIds = map nodeId masters
@@ -544,7 +546,7 @@ masterNodes (Connection nodeConnsVar _ shardMapVar _ _ _) = do
 
 getRandomConnection :: NodeConnection -> Connection -> IO NodeConnection
 getRandomConnection nc conn = do
-  let (Connection hmnVar _ _ _ _ _) = conn
+  let (Connection hmnVar _ _ _ _) = conn
   hmn <- readMVar hmnVar
   let conns = HM.elems hmn
   return $ fromMaybe (head conns) $ find (nc /= ) conns
