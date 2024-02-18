@@ -12,6 +12,7 @@ module Database.Redis.Cluster
   , NodeConnection(..)
   , Node(..)
   , ShardMap(..)
+  , Host
   , HashSlot
   , Shard(..)
   , TimeoutException(..)
@@ -37,8 +38,6 @@ import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
 import Data.Pool(Pool, createPool, withResource, destroyAllResources)
-import Control.Concurrent.Async(race)
-import Control.Concurrent(threadDelay)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
 import Control.Monad(zipWithM, when, replicateM, void)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
@@ -55,6 +54,7 @@ import Text.Read (readMaybe)
 import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
 import Network.TLS (ClientParams)
+import System.Timeout (timeout)
 
 -- This module implements a clustered connection whilst maintaining
 -- compatibility with the original Hedis codebase. In particular it still
@@ -456,10 +456,10 @@ nodeConnWithHostAndPort shardMap (Connection nodeConnsVar _ _ _ _) host port =
 nodeConnectionForCommand :: Connection -> ShardMap -> [B.ByteString] -> IO [NodeConnection]
 nodeConnectionForCommand conn@(Connection nodeConnsVar _ infoMap _ _) (ShardMap shardMap) request =
     case request of
-        ("FLUSHALL" : _) -> allNodes
-        ("FLUSHDB" : _) -> allNodes
-        ("QUIT" : _) -> allNodes
-        ("UNWATCH" : _) -> allNodes
+        ("FLUSHALL" : _) -> allNodes nodeConns
+        ("FLUSHDB" : _) -> allNodes nodeConns
+        ("QUIT" : _) -> allNodes nodeConns
+        ("UNWATCH" : _) -> allNodes nodeConns
         _ -> do
             keys <- requestKeys infoMap request
             hashSlot <- hashSlotForKeys (CrossSlotException [request]) keys
@@ -485,7 +485,7 @@ allMasterNodes (Connection nodeConnsVar _ _ _ _) (ShardMap shardMap) = do
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool lastRecvRef _) requests = withResource pool $ \ctx -> do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (0.5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- race (requestNodeImpl ctx) (threadDelay envTimeout)
+    eresp <- timexout envTimeout requestNodeImpl 
     case eresp of
       Left e -> return e
       Right _ -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")

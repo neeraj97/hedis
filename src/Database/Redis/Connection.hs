@@ -17,6 +17,7 @@ import Data.Functor(void)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Pool(Pool, withResource, createPool, destroyAllResources)
 import Data.Typeable
+import Data.List (nub)
 import qualified Data.Time as Time
 import Network.TLS (ClientParams)
 import qualified Network.Socket as NS
@@ -29,12 +30,9 @@ import Text.Read (readMaybe)
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Core(Redis, runRedisInternal, runRedisClusteredInternal)
 import Database.Redis.Protocol(Reply(..))
-import Database.Redis.Cluster(ShardMap(..), Node, Shard(..))
+import Database.Redis.Cluster(ShardMap(..), Node(..), Shard(..), NodeID, NodeConnection)
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
-import           Control.Concurrent (threadDelay)
-import           Control.Concurrent.Async (race)
-import Data.List (nub)
 
 import Database.Redis.Commands
     ( ping
@@ -46,6 +44,7 @@ import Database.Redis.Commands
     , ClusterSlotsResponse(..)
     , ClusterSlotsResponseEntry(..)
     , ClusterSlotsNode(..))
+import qualified System.Timeout as T
 
 --------------------------------------------------------------------------------
 -- Connection
@@ -118,6 +117,19 @@ defaultConnectInfo :: ConnectInfo
 defaultConnectInfo = ConnInfo
     { connectHost           = "localhost"
     , connectPort           = CC.PortNumber 6379
+    , connectAuth           = Nothing
+    , connectReadOnly       = False
+    , connectDatabase       = 0
+    , connectMaxConnections = 50
+    , connectMaxIdleTime    = 30
+    , connectTimeout        = Nothing
+    , connectTLSParams      = Nothing
+    }
+
+defaultClusterConnectInfo :: ConnectInfo
+defaultClusterConnectInfo = ConnInfo
+    { connectHost           = "localhost"
+    , connectPort           = CC.PortNumber 30001
     , connectAuth           = Nothing
     , connectReadOnly       = False
     , connectDatabase       = 0
@@ -210,8 +222,6 @@ instance Exception ClusterConnectError
 -- - PUBLISH, SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, RESET
 connectCluster :: ConnectInfo -> IO Connection
 connectCluster bootstrapConnInfo = do
-    let timeoutOptUs =
-          round . (1000000 *) <$> connectTimeout bootstrapConnInfo
     conn <- createConnection bootstrapConnInfo
     slotsResponse <- runRedisInternal conn clusterSlots
     shardMapVar <- case slotsResponse of
@@ -257,6 +267,10 @@ tcpConnWithAuth connectAuth connectTLSParams isConnectionReadOnly host port time
     when isConnectionReadOnly $ do
         runRedisInternal conn readOnly >> return ()
     return $ PP.toCtx conn'
+
+clusterConnectTimeoutinUs :: ConnectInfo -> Maybe Int
+clusterConnectTimeoutinUs bootstrapConnInfo =  
+    round . (1000000 *) <$> connectTimeout bootstrapConnInfo
 
 shardMapFromClusterSlotsResponse :: ClusterSlotsResponse -> IO ShardMap
 shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries where
