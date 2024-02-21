@@ -203,8 +203,8 @@ withCheckedConnect connInfo = bracket (checkedConnect connInfo) disconnect
 runRedis :: Connection -> Redis a -> IO a
 runRedis (NonClusteredConnection pool) redis =
   withResource pool $ \conn -> runRedisInternal conn redis
-runRedis (ClusteredConnection _ pool bootstrapConnInfo) redis =
-    withResource pool $ \conn -> runRedisClusteredInternal conn (refreshShardMap conn bootstrapConnInfo) redis
+runRedis (ClusteredConnection _ pool bootstrapConnInfo ) redis =
+    withResource pool $ \conn -> runRedisClusteredInternal conn (connectWithAuth bootstrapConnInfo) (refreshShardMap conn bootstrapConnInfo) redis
 
 newtype ClusterConnectError = ClusterConnectError Reply
     deriving (Eq, Show, Typeable)
