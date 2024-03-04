@@ -19,9 +19,10 @@ keyToSlot = HashSlot . (.&.) (numHashSlots - 1) . crc16 . findSubKey
 -- | Find the section of a key to compute the slot for.
 findSubKey :: BS.ByteString -> BS.ByteString
 findSubKey key = case Char8.break (=='{') key of
-  (whole, "") -> whole
+  (_, "") -> key -- No '{'
   (_, xs) -> case Char8.break (=='}') (Char8.tail xs) of
-    ("", _) -> key
+    ("", _) -> key -- Nothing between {}
+    (_, "") -> key -- No '}'
     (subKey, _) -> subKey
 
 crc16 :: BS.ByteString -> Word16
