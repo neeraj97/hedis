@@ -407,7 +407,7 @@ nodeConnForHashSlot shardMapVar conn errInfo hashSlot = do
             Nothing -> throwIO $ MissingNodeException ("HashSlot lookup failed in nodeConnForHashSlot" : errInfo)
             Just (Shard master _) -> return master
     case HM.lookup (nodeId node) nodeConns of
-        Nothing -> throwIO $ MissingNodeException ("NodeId lookup failed in nodeConnectionForCommand" : errInfo)
+        Nothing -> throwIO $ MissingNodeException ("NodeId lookup failed in nodeConnForHashSlot" : errInfo)
         Just nodeConn' -> return nodeConn'
 
 hashSlotForKeys :: Exception e => e -> [B.ByteString] -> IO HashSlot
