@@ -305,7 +305,7 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests withAuth = do
         return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
     retry :: CompletedRequest -> IO CompletedRequest
     retry (CompletedRequest index request thisReply) = do
-        retryReply <- head <$> retryBatch shardMapVar conn [request] [thisReply] withAuth
+        retryReply <- head <$> retryBatch shardMapVar conn [request] [thisReply] withAuth refreshShardmapAction
         return (CompletedRequest index request retryReply)
     refreshShardMapVar :: IO ()
     refreshShardMapVar = hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
@@ -313,14 +313,14 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests withAuth = do
 -- Retry a batch of requests if any of the responses is a redirect instruction.
 -- If multiple requests are passed in they're assumed to be a MULTI..EXEC
 -- transaction and will all be retried.
-retryBatch :: MVar ShardMap -> Connection -> [[B.ByteString]] -> [Reply] -> (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> IO [Reply]
-retryBatch shardMapVar conn requests replies withAuth =
+retryBatch :: MVar ShardMap -> Connection -> [[B.ByteString]] -> [Reply] -> (Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> IO ShardMap -> IO [Reply]
+retryBatch shardMapVar conn requests replies withAuth refreshShardmapAction =
     if any moved replies
         then do -- Refresh shardMap in MOVED case and do redis call
             let (Connection _ _ _ infoMap _) = conn
             keys <- mconcat <$> mapM (requestKeys infoMap) requests
             hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
-            nodeConn <- nodeConnForHashSlot shardMapVar conn ("retryBatch" : head requests) hashSlot
+            nodeConn <- nodeConnForHashSlot shardMapVar conn ("retryBatch" : head requests) hashSlot refreshShardmapAction 1
             requestNode nodeConn requests
         else case msum (askingRedirection <$> replies) of
             Just (host, port) -> do
@@ -355,7 +355,7 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' wit
     -- the commands in a transaction are applied and some are not. Better to
     -- fail early.
     hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
-    nodeConn <- nodeConnForHashSlot shardMapVar conn ("evaluateTransactionPipeline" : head requests) hashSlot
+    nodeConn <- nodeConnForHashSlot shardMapVar conn ("evaluateTransactionPipeline" : head requests) hashSlot refreshShardmapAction 1
     -- catch the exception thrown, send the command to random node.
     -- This change is required to handle the cluster topology change.
     eresps <- try $ requestNode nodeConn requests
@@ -394,11 +394,11 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' wit
     when (any moved resps)
       (hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction))
 
-    retryBatch shardMapVar conn requests resps withAuth
+    retryBatch shardMapVar conn requests resps withAuth refreshShardmapAction
 
 
-nodeConnForHashSlot :: MVar ShardMap -> Connection -> [B.ByteString] -> HashSlot -> IO NodeConnection
-nodeConnForHashSlot shardMapVar conn errInfo hashSlot = do
+nodeConnForHashSlot :: MVar ShardMap -> Connection -> [B.ByteString] -> HashSlot -> IO ShardMap -> Int -> IO NodeConnection
+nodeConnForHashSlot shardMapVar conn errInfo hashSlot refreshShardmapAction retriesLeft = do
     let (Connection nodeConnsMvar _ _ _ _) = conn
     (ShardMap shardMap) <- hasLocked $ readMVar shardMapVar
     nodeConns <- hasLocked $ readMVar nodeConnsMvar
@@ -407,7 +407,11 @@ nodeConnForHashSlot shardMapVar conn errInfo hashSlot = do
             Nothing -> throwIO $ MissingNodeException ("HashSlot lookup failed in nodeConnForHashSlot" : errInfo)
             Just (Shard master _) -> return master
     case HM.lookup (nodeId node) nodeConns of
-        Nothing -> throwIO $ MissingNodeException ("NodeId lookup failed in nodeConnForHashSlot" : errInfo)
+        Nothing -> if retriesLeft < 1
+            then throwIO $ MissingNodeException ("NodeId lookup failed in nodeConnForHashSlot" : errInfo)
+            else do -- TODO: Ideally shardMap and nodeConns should be in sync and we should not get Nothing. Need to fix this
+                hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
+                nodeConnForHashSlot shardMapVar conn errInfo hashSlot refreshShardmapAction (retriesLeft - 1)
         Just nodeConn' -> return nodeConn'
 
 hashSlotForKeys :: Exception e => e -> [B.ByteString] -> IO HashSlot
