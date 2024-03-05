@@ -362,12 +362,9 @@ evaluateTransactionPipeline shardMapVar refreshShardmapAction conn requests' wit
     resps <-
       case eresps of
         Right v -> return v
-        Left (err :: SomeException) -> do 
-          case fromException err of
-            Just (er :: TimeoutException) -> throwIO er
-            _ -> do
-              randConn <- getRandomConnection nodeConn conn
-              requestNode randConn requests
+        Left (_ :: SomeException) -> do 
+            randConn <- getRandomConnection nodeConn conn
+            requestNode randConn requests
     -- The Redis documentation has the following to say on the effect of
     -- resharding on multi-key operations:
     --
