@@ -10,7 +10,7 @@ import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when,foldM)
 
-import Control.Concurrent.MVar(newMVar, putMVar, readMVar, modifyMVar_, tryTakeMVar)
+import Control.Concurrent.MVar(modifyMVar)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
@@ -224,17 +224,15 @@ connectCluster :: ConnectInfo -> IO Connection
 connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} = do
     conn <- createConnection bootstrapConnInfo
     slotsResponse <- runRedisInternal conn clusterSlots
-    shardMapVar <- case slotsResponse of
+    shardMap <- case slotsResponse of
         Left e -> throwIO $ ClusterConnectError e
-        Right slots -> do
-            shardMap <- shardMapFromClusterSlotsResponse slots
-            newMVar shardMap
+        Right slots -> shardMapFromClusterSlotsResponse slots
     commandInfos <- runRedisInternal conn command
     case commandInfos of
         Left e -> throwIO $ ClusterConnectError e
         Right infos -> do
             let withAuth = connectWithAuth bootstrapConnInfo 
-            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime infos shardMapVar
+            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime infos shardMap
             return $ ClusteredConnection bootstrapConnInfo clusterConnection
 
 connectWithAuth :: ConnectInfo -> Cluster.Host -> CC.PortID -> IO CC.ConnectionContext
@@ -278,17 +276,11 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
 refreshShardMap :: ConnectInfo -> Cluster.Connection ->  IO ShardMap
-refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection nodeConnMapVar shardMapVar _ _) = do
-    nodeConns <- readMVar nodeConnMapVar
-    maybeShardMap <- tryTakeMVar shardMapVar
-    case maybeShardMap of 
-        Just _ -> do
-            newShardMap <- refreshShardMapWithNodeConn (HM.elems nodeConns)
-            modifyMVar_ nodeConnMapVar $ \oldNodeConnMap -> do
-                updateNodeConnections newShardMap oldNodeConnMap
-            putMVar shardMapVar newShardMap
-            return newShardMap
-        Nothing -> readMVar shardMapVar
+refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) = do
+    modifyMVar shardNodeVar $ \(_, oldNodeConnMap) -> do
+        newShardMap <- refreshShardMapWithNodeConn (HM.elems oldNodeConnMap)
+        newNodeConnMap <- updateNodeConnections newShardMap oldNodeConnMap        
+        return ((newShardMap, newNodeConnMap), newShardMap)
     where
         withAuth :: Cluster.Host -> CC.PortID -> IO CC.ConnectionContext
         withAuth = connectWithAuth connectInfo
