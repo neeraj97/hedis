@@ -173,14 +173,14 @@ destroyNodeResources (Connection shardNodeVar _ _) =
 -- be executed implicitly as soon as any result returned from this function is
 -- evaluated.
 requestPipelined :: IO ShardMap -> Connection -> [B.ByteString] -> MVar Pipeline -> IO Reply
-requestPipelined refreshShardmapAction conn@(Connection shardNodeVar _ _) nextRequest pipelineVar = modifyMVar pipelineVar $ \(Pipeline stateVar) -> do
+requestPipelined refreshShardmapAction conn nextRequest pipelineVar = modifyMVar pipelineVar $ \(Pipeline stateVar) -> do
     (newStateVar, repliesIndex) <- hasLocked $ modifyMVar stateVar $ \case
         Pending requests | isMulti nextRequest -> do
-            replies <- evaluatePipeline shardNodeVar refreshShardmapAction conn requests
+            replies <- evaluatePipeline refreshShardmapAction conn requests
             s' <- newMVar $ TransactionPending [nextRequest]
             return (Executed replies, (s', 0))
         Pending requests | length requests > 1000 -> do
-            replies <- evaluatePipeline shardNodeVar refreshShardmapAction conn (nextRequest:requests)
+            replies <- evaluatePipeline refreshShardmapAction conn (nextRequest:requests)
             return (Executed replies, (stateVar, length requests))
         Pending requests ->
             return (Pending (nextRequest:requests), (stateVar, length requests))
@@ -202,7 +202,7 @@ requestPipelined refreshShardmapAction conn@(Connection shardNodeVar _ _) nextRe
             Executed replies ->
                 return (Executed replies, replies)
             Pending requests-> do
-                replies <- evaluatePipeline shardNodeVar refreshShardmapAction conn requests
+                replies <- evaluatePipeline refreshShardmapAction conn requests
                 return (Executed replies, replies)
             TransactionPending requests-> do
                 replies <- evaluateTransactionPipeline refreshShardmapAction conn requests
@@ -241,16 +241,16 @@ rawResponse (CompletedRequest _ _ r) = r
 -- step is not pipelined, there is a request per error. This is probably
 -- acceptable in most cases as these errors should only occur in the case of
 -- cluster reconfiguration events, which should be rare.
-evaluatePipeline :: (MVar (ShardMap, NodeConnectionMap)) -> IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
-evaluatePipeline shardNodeVar refreshShardmapAction conn requests = do
-        (shardMap, _) <- hasLocked $ readMVar shardNodeVar
-        erequestsByNode <- try $ getRequestsByNode shardMap
+evaluatePipeline :: IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
+evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) requests = do
+        (shardMap, nodesConn) <- hasLocked $ readMVar shardNodeVar
+        erequestsByNode <- try $ getRequestsByNode shardMap nodesConn
         requestsByNode <- case erequestsByNode of
-            Right reqByNode-> pure reqByNode
+            Right reqByNode -> pure reqByNode
             Left (_ :: MissingNodeException) -> do
                 refreshShardMapVar
-                (newShardMap, _) <- hasLocked $ readMVar shardNodeVar
-                getRequestsByNode newShardMap
+                (newShardMap, newNodeConn) <- hasLocked $ readMVar shardNodeVar
+                getRequestsByNode newShardMap newNodeConn
         -- catch the exception thrown at each node level
         -- send the command to random node.
         -- merge the current responses with new responses.
@@ -272,24 +272,24 @@ evaluatePipeline shardNodeVar refreshShardmapAction conn requests = do
             ) (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
         when (any (moved . rawResponse) resps) refreshShardMapVar
-        retriedResps <- mapM (retry 0 shardMap) resps
+        retriedResps <- mapM (retry 0) resps
         return $ map rawResponse $ sortBy (on compare responseIndex) retriedResps
   where
-    getRequestsByNode :: ShardMap -> IO [(NodeConnection, [PendingRequest])]
-    getRequestsByNode shardMap = do
-        commandsWithNodes <- zipWithM (requestWithNodes shardMap) (reverse [0..(length requests - 1)]) requests
+    getRequestsByNode :: ShardMap -> NodeConnectionMap -> IO [(NodeConnection, [PendingRequest])]
+    getRequestsByNode shardMap nodeConnMap = do
+        commandsWithNodes <- zipWithM (requestWithNodes shardMap nodeConnMap) (reverse [0..(length requests - 1)]) requests
         return $ assocs $ fromListWith (++) (mconcat commandsWithNodes)
-    requestWithNodes :: ShardMap -> Int -> [B.ByteString] -> IO [(NodeConnection, [PendingRequest])]
-    requestWithNodes shardMap index request = do
-        nodeConns <- nodeConnectionForCommand conn shardMap request
+    requestWithNodes :: ShardMap -> NodeConnectionMap -> Int -> [B.ByteString] -> IO [(NodeConnection, [PendingRequest])]
+    requestWithNodes shardMap nodeConnMap index request = do
+        nodeConns <- nodeConnectionForCommand shardMap nodeConnMap infoMap request
         return $ (, [PendingRequest index request]) <$> nodeConns
     executeRequests :: NodeConnection -> [PendingRequest] -> IO [CompletedRequest]
     executeRequests nodeConn nodeRequests = do
         replies <- requestNode nodeConn $ map rawRequest nodeRequests
         return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
-    retry :: Int -> ShardMap ->  CompletedRequest -> IO CompletedRequest
-    retry retryCount shardMap (CompletedRequest index request thisReply) = do
-        retryReply <- head <$> retryBatch shardMap refreshShardmapAction conn retryCount [request] [thisReply]
+    retry :: Int -> CompletedRequest -> IO CompletedRequest
+    retry retryCount (CompletedRequest index request thisReply) = do
+        retryReply <- head <$> retryBatch refreshShardmapAction conn retryCount [request] [thisReply]
         return (CompletedRequest index request retryReply)
     refreshShardMapVar :: IO ()
     refreshShardMapVar = void $ hasLocked $ refreshShardmapAction
@@ -297,25 +297,24 @@ evaluatePipeline shardNodeVar refreshShardmapAction conn requests = do
 -- Retry a batch of requests if any of the responses is a redirect instruction.
 -- If multiple requests are passed in they're assumed to be a MULTI..EXEC
 -- transaction and will all be retried.
-retryBatch :: ShardMap -> IO ShardMap -> Connection -> Int -> [[B.ByteString]] -> [Reply] -> IO [Reply]
-retryBatch shardMap refreshShardmapAction conn retryCount requests replies =
+retryBatch :: IO ShardMap -> Connection -> Int -> [[B.ByteString]] -> [Reply] -> IO [Reply]
+retryBatch refreshShardmapAction conn@(Connection _ infoMap _) retryCount requests replies =
     -- The last reply will be the `EXEC` reply containing the redirection, if
     -- there is one.
     case last replies of
         (Error errString) | B.isPrefixOf "MOVED" errString -> do
-            let (Connection _ infoMap _) = conn
             keys <- mconcat <$> mapM (requestKeys infoMap) requests
             hashSlot <- hashSlotForKeys (CrossSlotException requests) keys
             nodeConn <- nodeConnForHashSlot conn (MissingNodeException (head requests)) hashSlot
             requestNode nodeConn requests
         (askingRedirection -> Just (host, port)) -> do
-            maybeAskNode <- nodeConnWithHostAndPort shardMap conn host port
+            maybeAskNode <- nodeConnWithHostAndPort conn host port
             case maybeAskNode of
                 Just askNode -> tail <$> requestNode askNode (["ASKING"] : requests)
                 Nothing -> case retryCount of
                     0 -> do
                         _ <- hasLocked $ refreshShardmapAction
-                        retryBatch shardMap refreshShardmapAction conn (retryCount + 1) requests replies
+                        retryBatch refreshShardmapAction conn (retryCount + 1) requests replies
                     _ -> throwIO $ MissingNodeException (head requests)
         _ -> return replies
 
@@ -323,7 +322,7 @@ retryBatch shardMap refreshShardmapAction conn retryCount requests replies =
 -- Like `evaluateOnPipeline`, except we expect to be able to run all commands
 -- on a single shard. Failing to meet this expectation is an error.
 evaluateTransactionPipeline :: IO ShardMap -> Connection -> [[B.ByteString]] -> IO [Reply]
-evaluateTransactionPipeline refreshShardmapAction conn@(Connection shardNodeVar _ _) requests' = do
+evaluateTransactionPipeline refreshShardmapAction conn requests' = do
     let requests = reverse requests'
     let (Connection _ infoMap _) = conn
     keys <- mconcat <$> mapM (requestKeys infoMap) requests
@@ -385,8 +384,7 @@ evaluateTransactionPipeline refreshShardmapAction conn@(Connection shardNodeVar 
                             case askingRedirection heads of
                                 Just (host,port) -> do 
                                         void $ hasLocked $ refreshShardmapAction
-                                        (shardMap, _) <- hasLocked $ readMVar shardNodeVar
-                                        maybeAskNode <- nodeConnWithHostAndPort shardMap conn host port
+                                        maybeAskNode <- nodeConnWithHostAndPort conn host port
                                         case maybeAskNode of
                                             Just askNode -> Right . tail <$> requestNode askNode (["ASKING"] : requests)
                                             Nothing -> do
@@ -441,16 +439,15 @@ moved (Error errString) = case Char8.words errString of
 moved _ = False
 
 
-nodeConnWithHostAndPort :: ShardMap -> Connection -> Host -> Port -> IO (Maybe NodeConnection)
-nodeConnWithHostAndPort shardMap (Connection shardNodeVar _ _) host port =
+nodeConnWithHostAndPort :: Connection -> Host -> Port -> IO (Maybe NodeConnection)
+nodeConnWithHostAndPort (Connection shardNodeVar _ _) host port = do
+    (shardMap, nodeConns) <- hasLocked $ readMVar shardNodeVar
     case nodeWithHostAndPort shardMap host port of
         Nothing -> return Nothing
-        Just node -> do
-            (_, nodeConns) <- hasLocked $ readMVar shardNodeVar
-            return (HM.lookup (nodeId node) nodeConns)
+        Just node -> return (HM.lookup (nodeId node) nodeConns)
 
-nodeConnectionForCommand :: Connection -> ShardMap -> [B.ByteString] -> IO [NodeConnection]
-nodeConnectionForCommand conn@(Connection shardNodeVar infoMap _) (ShardMap shardMap) request =
+nodeConnectionForCommand :: ShardMap -> NodeConnectionMap -> CMD.InfoMap -> [B.ByteString] -> IO [NodeConnection]
+nodeConnectionForCommand (ShardMap shardMap) nodeConns infoMap request =
     case request of
         ("FLUSHALL" : _) -> allNodes
         ("FLUSHDB" : _) -> allNodes
@@ -462,18 +459,16 @@ nodeConnectionForCommand conn@(Connection shardNodeVar infoMap _) (ShardMap shar
             node <- case IntMap.lookup (fromEnum hashSlot) shardMap of
                 Nothing -> throwIO $ MissingNodeException request
                 Just (Shard master _) -> return master
-            (_, nodeConns) <- hasLocked $ readMVar shardNodeVar
             maybe (throwIO $ MissingNodeException request) (return . return) (HM.lookup (nodeId node) nodeConns)
     where
         allNodes = do
-            maybeNodes <- allMasterNodes conn (ShardMap shardMap)
+            maybeNodes <- allMasterNodes (ShardMap shardMap) nodeConns
             case maybeNodes of
                 Nothing -> throwIO $ MissingNodeException request
                 Just allNodes' -> return allNodes'
 
-allMasterNodes :: Connection -> ShardMap -> IO (Maybe [NodeConnection])
-allMasterNodes (Connection shardNodeVar _ _) (ShardMap shardMap) = do
-    (_, nodeConns) <- hasLocked $ readMVar shardNodeVar
+allMasterNodes :: ShardMap -> NodeConnectionMap -> IO (Maybe [NodeConnection])
+allMasterNodes (ShardMap shardMap) nodeConns = do
     return $ mapM (flip HM.lookup nodeConns . nodeId) onlyMasterNodes
   where
     onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
