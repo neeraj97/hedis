@@ -412,7 +412,7 @@ nodeConnForHashSlot shardMapVar conn errInfo hashSlot refreshShardmapAction retr
     case HM.lookup (nodeId node) nodeConns of
         Nothing -> if retriesLeft < 1
             then throwIO $ MissingNodeException ("NodeId lookup failed in nodeConnForHashSlot" : errInfo)
-            else do
+            else do -- TODO: Ideally shardMap and nodeConns should be in sync and we should not get Nothing. Need to fix this
                 hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
                 nodeConnForHashSlot shardMapVar conn errInfo hashSlot refreshShardmapAction (retriesLeft - 1)
         Just nodeConn' -> return nodeConn'
