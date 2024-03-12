@@ -892,7 +892,7 @@ xreadOpts streamsAndIds opts = sendRequest $
 
 internalXreadArgs :: [(ByteString, ByteString)] -> XReadOpts -> [ByteString]
 internalXreadArgs streamsAndIds XReadOpts{..} =
-    concat [blockArgs, countArgs, noackArgs, ["STREAMS"], streams, recordIds]
+    concat [blockArgs, noackArgs, countArgs, ["STREAMS"], streams, recordIds]
     where
         blockArgs = maybe [] (\blockMillis -> ["BLOCK", encode blockMillis]) block
         countArgs = maybe [] (\countRecords -> ["COUNT", encode countRecords]) recordCount
