@@ -526,7 +526,7 @@ setOpts
     => ByteString -- ^ key
     -> ByteString -- ^ value
     -> SetOpts
-    -> m (f Status)
+    -> m (f (Maybe Status))
 setOpts key value SetOpts{..} =
     sendRequest $ concat [["SET", key, value], ex, px, condition]
   where
