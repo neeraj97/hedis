@@ -91,7 +91,8 @@ library
                     errors,
                     network-uri,
                     unliftio-core,
-                    random
+                    random,
+                    extra
   if !impl(ghc >= 8.0)
     build-depends:
       semigroups >= 0.11 && < 0.19
@@ -122,7 +123,8 @@ benchmark hedis-benchmark
         mtl >= 2.0,
         hedis,
         bytestring,
-        time >= 1.2
+        time >= 1.2,
+        random
     other-modules: ClusterBenchmark
     ghc-options: -O2 -Wall -rtsopts
     if flag(dev)

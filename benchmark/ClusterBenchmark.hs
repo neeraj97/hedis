@@ -9,10 +9,11 @@ import Data.Time
 import Database.Redis hiding (append)
 import Text.Printf
 import qualified Data.ByteString.Char8 as BS
+import System.Random (randomRIO)
 
 nRequests, nClients :: Int
-nRequests = 10000
-nClients  = 50
+nRequests = 30000
+nClients  = 150
 
 
 clusterBenchMark :: IO ()
@@ -42,16 +43,16 @@ clusterBenchMark = do
     start <- newEmptyMVar
     done  <- newEmptyMVar
     replicateM_ nClients $ forkIO $ do
-        runRedis conn $ forever $ do
-            action <- liftIO $ takeMVar start
-            action
-            liftIO $ putMVar done ()
+        forever $ do
+          (reps,action) <- liftIO $ takeMVar start
+          replicateM_ reps $ runRedis conn action
+          liftIO $ putMVar done ()
     
     let timeAction name nActions action = do
           startT <- getCurrentTime
           -- each clients runs ACTION nRepetitions times
           let nRepetitions = nRequests `div` nClients `div` nActions
-          replicateM_ nClients $ putMVar start (replicateM_ nRepetitions action)
+          replicateM_ nClients $ putMVar start (nRepetitions,action)
           replicateM_ nClients $ takeMVar done
           stopT <- getCurrentTime
           let deltaT     = realToFrac $ diffUTCTime stopT startT
@@ -80,6 +81,13 @@ clusterBenchMark = do
 
     timeAction "get" 1 $ do
         get "key" >>= \case
+          Right Nothing -> return ()
+          _ -> error "error"
+        return ()
+
+    timeAction "get random keys" 1 $ do
+        key <- randomRIO (0::Int, 16000)
+        get (BS.pack (show key)) >>= \case
           Right Nothing -> return ()
           _ -> error "error"
         return ()

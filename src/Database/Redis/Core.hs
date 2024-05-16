@@ -15,6 +15,7 @@ import Prelude
 #if __GLASGOW_HASKELL__ < 710
 import Control.Applicative
 #endif
+import Control.Concurrent.MVar (newMVar)
 import Control.Monad.Reader
 import qualified Data.ByteString as B
 import Data.IORef
@@ -24,7 +25,6 @@ import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Types
 import Database.Redis.Cluster(ShardMap)
 import qualified Database.Redis.Cluster as Cluster
-import qualified Database.Redis.ConnectionContext as CC
 
 --------------------------------------------------------------------------------
 -- The Redis Monad
@@ -73,10 +73,12 @@ runRedisInternal conn (Redis redis) = do
   readIORef ref >>= (`seq` return ())
   return r
 
-runRedisClusteredInternal :: Cluster.Connection -> (Cluster.Host -> CC.PortID -> Maybe Int -> IO CC.ConnectionContext) -> IO ShardMap -> Redis a -> IO a
-runRedisClusteredInternal connection withAuth refreshShardmapAction (Redis redis) = do
+runRedisClusteredInternal :: Cluster.Connection -> IO ShardMap -> Redis a -> IO a
+runRedisClusteredInternal connection refreshShardmapAction (Redis redis) = do
     ref <- newIORef (SingleLine "nobody will ever see this")
-    r <- runReaderT redis (ClusteredEnv refreshShardmapAction connection ref withAuth)
+    stateVar <- liftIO $ newMVar $ Cluster.Pending []
+    pipelineVar <- liftIO $ newMVar $ Cluster.Pipeline stateVar
+    r <- runReaderT redis (ClusteredEnv refreshShardmapAction connection ref pipelineVar) 
     readIORef ref >>= (`seq` return ())
     return r
 
@@ -118,7 +120,7 @@ sendRequest req = do
                 setLastReply r
                 return r
             ClusteredEnv{..} -> do
-                r <- liftIO $ Cluster.requestPipelined refreshAction connection req withAuth
+                r <- liftIO $ Cluster.requestPipelined refreshAction connection req pipeline
                 lift (writeIORef clusteredLastReply r)
                 return r
     returnDecode r'
