@@ -17,7 +17,7 @@ import Data.Functor(void)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Pool(Pool, withResource, createPool, destroyAllResources)
 import Data.Typeable
-import Data.List (nub, find)
+import Data.List (nub)
 import qualified Data.Time as Time
 import Network.TLS (ClientParams)
 import qualified Network.Socket as NS
@@ -295,7 +295,7 @@ refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (
                  ) HM.empty (nub $ Cluster.nodes newShardMap)
 
 refreshShardMapWithNodeConn :: Maybe Cluster.NodeConnection -> [Cluster.NodeConnection] -> IO ShardMap
-refreshShardMapWithNodeConn Nothing [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+refreshShardMapWithNodeConn _ [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
 refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
     let numOfNodes = length nodeConnsList
     selectedIdx <- randomRIO (0, length nodeConnsList - 1)
@@ -304,7 +304,9 @@ refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
     case eresp of 
         Left  (_::SomeException) ->  do                 -- retry on other node
             let otherSelectedIdx                        = (selectedIdx + 1) `mod` numOfNodes
-                (Cluster.NodeConnection otherPool _)    = fromMaybe (nodeConnsList !! otherSelectedIdx) (maybeNodeConn >>= \nodeConn -> find (nodeConn /=) nodeConnsList)
+                (Cluster.NodeConnection otherPool _)    = maybe (nodeConnsList !! otherSelectedIdx) 
+                                                                (\nc -> if nc /= nodeConnsList !! selectedIdx then nodeConnsList !! selectedIdx else nodeConnsList !! otherSelectedIdx) 
+                                                                (maybeNodeConn)
             refreshShardMapWithPool otherPool
         Right shardMap -> return shardMap
     where 
