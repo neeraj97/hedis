@@ -17,7 +17,7 @@ import Data.Functor(void)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Pool(Pool, withResource, createPool, destroyAllResources)
 import Data.Typeable
-import Data.List (nub)
+import Data.List (nub, find)
 import qualified Data.Time as Time
 import Network.TLS (ClientParams)
 import qualified Network.Socket as NS
@@ -30,7 +30,7 @@ import Text.Read (readMaybe)
 import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Core(Redis, runRedisInternal, runRedisClusteredInternal)
 import Database.Redis.Protocol(Reply(..))
-import Database.Redis.Cluster(ShardMap(..), Node(..), Shard(..))
+import Database.Redis.Cluster(ShardMap(..), Node(..), Shard(..), NodeConnectionMap)
 import qualified Database.Redis.Cluster as Cluster
 import qualified Database.Redis.ConnectionContext as CC
 import qualified System.Timeout as T
@@ -275,12 +275,12 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr m
         in
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
 
-refreshShardMap :: ConnectInfo -> Cluster.Connection ->  IO ShardMap
-refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) = do
+refreshShardMap :: ConnectInfo -> Cluster.Connection -> Maybe Cluster.NodeConnection -> IO (ShardMap, NodeConnectionMap)
+refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) nodeConn = do
     modifyMVar shardNodeVar $ \(_, oldNodeConnMap) -> do
-        newShardMap <- refreshShardMapWithNodeConn (HM.elems oldNodeConnMap)
+        newShardMap <- refreshShardMapWithNodeConn nodeConn (HM.elems oldNodeConnMap)
         newNodeConnMap <- updateNodeConnections newShardMap oldNodeConnMap        
-        return ((newShardMap, newNodeConnMap), newShardMap)
+        return ((newShardMap, newNodeConnMap), (newShardMap, newNodeConnMap))
     where
         withAuth :: Cluster.Host -> CC.PortID -> IO CC.ConnectionContext
         withAuth = connectWithAuth connectInfo
@@ -294,17 +294,17 @@ refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (
                         return $ HM.insert nodeid nodeConnPool acc
                  ) HM.empty (nub $ Cluster.nodes newShardMap)
 
-refreshShardMapWithNodeConn :: [Cluster.NodeConnection] -> IO ShardMap
-refreshShardMapWithNodeConn [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
-refreshShardMapWithNodeConn nodeConnsList = do
+refreshShardMapWithNodeConn :: Maybe Cluster.NodeConnection -> [Cluster.NodeConnection] -> IO ShardMap
+refreshShardMapWithNodeConn Nothing [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
     let numOfNodes = length nodeConnsList
     selectedIdx <- randomRIO (0, length nodeConnsList - 1)
-    let (Cluster.NodeConnection pool _) = nodeConnsList !! selectedIdx
+    let (Cluster.NodeConnection pool _) = fromMaybe (nodeConnsList !! selectedIdx) maybeNodeConn
     eresp <- try $ refreshShardMapWithPool pool
     case eresp of 
         Left  (_::SomeException) ->  do                 -- retry on other node
             let otherSelectedIdx                        = (selectedIdx + 1) `mod` numOfNodes
-                (Cluster.NodeConnection otherPool _)    = nodeConnsList !! otherSelectedIdx
+                (Cluster.NodeConnection otherPool _)    = fromMaybe (nodeConnsList !! otherSelectedIdx) (maybeNodeConn >>= \nodeConn -> find (nodeConn /=) nodeConnsList)
             refreshShardMapWithPool otherPool
         Right shardMap -> return shardMap
     where 
