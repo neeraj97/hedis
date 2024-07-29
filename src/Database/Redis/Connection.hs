@@ -324,7 +324,7 @@ refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
                                 Right shardMap -> pure shardMap 
                                 Left (err :: SomeException) -> do
                                     print $ "ShardMapRefreshError-" <> show err 
-                                    throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")
+                                    throwIO $ ClusterConnectError (Error $ Char8.pack ("Couldn't refresh shardMap due to error - " <> show err))
 
 refreshShardMapWithConn :: PP.Connection -> Bool -> IO ShardMap
 refreshShardMapWithConn pipelineConn _ = do

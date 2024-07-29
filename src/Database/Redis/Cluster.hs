@@ -271,19 +271,17 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
                                         Just (er :: TimeoutException) -> hasLocked $ refreshShardmapAction Nothing >> throwIO er
                                         _ -> getRandomConnection nc conn >>= (`executeRequests` r)
                 refreshedShardMapAndNodeConnsIORef <- IOR.newIORef Nothing
-                concat <$> mapM (\completedRequest@(CompletedRequest index request response) -> 
-                    if moved response then do
-                        map (CompletedRequest index request) <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
-                    else
-                        case askingRedirection response of
-                            Just (host,port) -> do 
+                mapM (\completedRequest@(CompletedRequest index request response) -> 
+                    case response of
+                        (Error errString) | B.isPrefixOf "MOVED" errString -> CompletedRequest index request <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
+                        (askingRedirection -> Just (host, port)) -> do 
                                 refreshedShardMapAndNodeConns <- fromMaybeM (hasLocked $ refreshShardmapAction (Just nc)) $ IOR.readIORef refreshedShardMapAndNodeConnsIORef
                                 maybeAskNode <- nodeConnWithHostAndPort refreshedShardMapAndNodeConns host port
                                 case maybeAskNode of
-                                    Just askNode -> map (CompletedRequest index request) <$> tail <$> requestNode askNode (["ASKING"] : [request])
+                                    Just askNode -> CompletedRequest index request <$> (head <$> tail <$> requestNode askNode (["ASKING"] : [request]))
                                     Nothing -> do
-                                        map (CompletedRequest index request) <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
-                            Nothing -> return [completedRequest]
+                                        CompletedRequest index request <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
+                        _ -> return completedRequest
                     ) responses
             ) (zip eresps requestsByNode)
         return $ map rawResponse $ sortBy (on compare responseIndex) resps
@@ -300,12 +298,12 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
     executeRequests nodeConn nodeRequests = do
         replies <- requestNode nodeConn $ map rawRequest nodeRequests
         return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
-    refreshShardMapAndRetryRequest :: IOR.IORef (Maybe (ShardMap, NodeConnectionMap)) -> IO (ShardMap, NodeConnectionMap) -> [B.ByteString] -> IO [Reply]
+    refreshShardMapAndRetryRequest :: IOR.IORef (Maybe (ShardMap, NodeConnectionMap)) -> IO (ShardMap, NodeConnectionMap) -> [B.ByteString] -> IO Reply
     refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef refreshShardmap request =  do 
         (newShardMap, newNodeConn) <- fromMaybeM (hasLocked refreshShardmap >>= (\new -> IOR.writeIORef refreshedShardMapAndNodeConnsIORef (Just new) >> return new )) $ 
                                         IOR.readIORef refreshedShardMapAndNodeConnsIORef
         nodeConns <- nodeConnectionForCommand newShardMap newNodeConn infoMap request
-        requestNode (head nodeConns) [request]
+        head <$> requestNode (head nodeConns) [request]
 
 --fix multi exec
 -- Like `evaluateOnPipeline`, except we expect to be able to run all commands
