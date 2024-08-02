@@ -92,6 +92,10 @@ data ConnectInfo = ConnInfo
     --   get connected in this interval of time.
     , connectTLSParams      :: Maybe ClientParams
     -- ^ Optional TLS parameters. TLS will be enabled if this is provided.
+    , requestTimeout        :: Maybe Double
+    -- ^ timeout for a redis command request in seconds example: 0.5 seconds (500 milliseconds)
+    -- post requestTimeout, TimeoutException will be thrown. This is now only applicable to cluster redis.
+    -- TODO add for non cluster redis also
     } deriving Show
 
 data ConnectError = ConnectAuthError Reply
@@ -124,6 +128,7 @@ defaultConnectInfo = ConnInfo
     , connectMaxIdleTime    = 30
     , connectTimeout        = Nothing
     , connectTLSParams      = Nothing
+    , requestTimeout        = Nothing
     }
 
 defaultClusterConnectInfo :: ConnectInfo
@@ -137,6 +142,7 @@ defaultClusterConnectInfo = ConnInfo
     , connectMaxIdleTime    = 30
     , connectTimeout        = Nothing
     , connectTLSParams      = Nothing
+    , requestTimeout        = Nothing
     }
 
 createConnection :: ConnectInfo -> IO PP.Connection
@@ -221,7 +227,7 @@ instance Exception ClusterConnectError
 -- - MOVE, SELECT
 -- - PUBLISH, SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, RESET
 connectCluster :: ConnectInfo -> IO Connection
-connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} = do
+connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime,requestTimeout} = do
     conn <- createConnection bootstrapConnInfo
     slotsResponse <- runRedisInternal conn clusterSlots
     shardMap <- case slotsResponse of
@@ -232,7 +238,7 @@ connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTi
         Left e -> throwIO $ ClusterConnectError e
         Right infos -> do
             let withAuth = connectWithAuth bootstrapConnInfo 
-            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime infos shardMap
+            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime infos shardMap requestTimeout
             return $ ClusteredConnection bootstrapConnInfo clusterConnection
 
 connectWithAuth :: ConnectInfo -> Cluster.Host -> CC.PortID -> IO CC.ConnectionContext
