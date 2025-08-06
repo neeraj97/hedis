@@ -8,6 +8,7 @@ import Control.Monad.Trans
 import Data.Time
 import Database.Redis
 import Text.Printf
+import qualified ClusterBenchmark as CB
 
 nRequests, nClients :: Int
 nRequests = 100000
@@ -111,3 +112,5 @@ main = do
           _ -> error "error"
         return ()
     
+    putStrLn "-------Redis Cluster Benchmark-------"
+    CB.clusterBenchMark
