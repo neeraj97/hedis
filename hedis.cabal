@@ -125,7 +125,7 @@ benchmark hedis-benchmark
         random,
         file-embed
     other-modules: ClusterBenchmark
-    ghc-options: -O2 -Wall -rtsopts
+    ghc-options: -O2 -Wall -rtsopts -threaded
     if flag(dev)
       ghc-options: -Werror
     if flag(dev)

@@ -13,7 +13,7 @@ import qualified Data.List.NonEmpty as NE
 
 nRequests, nClients :: Int
 nRequests = 1
-nClients  = 1
+nClients  = 128
 
 
 clusterBenchMark :: IO ()
@@ -45,7 +45,10 @@ clusterBenchMark = do
     replicateM_ nClients $ forkIO $ do
         runRedis conn $ forever $ do
             action <- liftIO $ takeMVar start
+            startT <- liftIO getCurrentTime
             action
+            stopT <- liftIO getCurrentTime
+            liftIO $ print $ diffUTCTime stopT startT
             liftIO $ putMVar done ()
     
     let timeAction nActions action = do
@@ -59,6 +62,7 @@ clusterBenchMark = do
               -- the real # of reqs send. We might have lost some due to 'div'.
               -- actualReqs = nRepetitions * nActions * nClients
               -- rqsPerSec  = fromIntegral actualReqs / deltaT :: Double
+          print ("Final result:"::String)
           print deltaT
 
     ----------------------------------------------------------------------
@@ -85,7 +89,7 @@ clusterBenchMark = do
     --       _ -> error "error"
     --     return ()
     
-    timeAction 10 $ do
+    timeAction 1 $ do
         res <- mapM get $ keyGenerator 100000 "k1"
         -- liftIO $ threadDelay $ (10 ^ (6 :: Int))*10
         -- res2 <- mapM get $ keyGenerator 100 "k1"
