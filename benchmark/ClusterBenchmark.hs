@@ -95,7 +95,7 @@ clusterBenchMark = do
     --       _ -> error "error"
     --     return ()
     
-    timeAction 10 $ do
+    timeAction 1 $ do
         res <- mapM get $ keyGenerator 100000 "k1"
         -- liftIO $ threadDelay $ (10 ^ (6 :: Int))*10
         -- res2 <- mapM get $ keyGenerator 100 "k1"
