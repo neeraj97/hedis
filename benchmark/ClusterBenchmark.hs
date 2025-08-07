@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, LambdaCase #-}
+{-# LANGUAGE OverloadedStrings, LambdaCase, ScopedTypeVariables,BangPatterns #-}
 
 module ClusterBenchmark where
 
@@ -10,6 +10,7 @@ import Database.Redis hiding (append)
 -- import Text.Printf
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.List.NonEmpty as NE
+import Control.Exception
 
 nRequests, nClients :: Int
 nRequests = 1
@@ -21,7 +22,7 @@ clusterBenchMark = do
     ----------------------------------------------------------------------
     -- Preparation
     --
-    conn <- connectCluster defaultConnectInfo{connectPort = PortNumber 30001}
+    conn <- connectCluster defaultConnectInfo{connectPort = PortNumber 30001, connectMaxConnections= 50}
     runRedis conn $ do
         _ <- flushall
         _ <- ping >>= \case
@@ -43,13 +44,18 @@ clusterBenchMark = do
     start <- newEmptyMVar
     done  <- newEmptyMVar
     replicateM_ nClients $ forkIO $ do
-        runRedis conn $ forever $ do
-            action <- liftIO $ takeMVar start
-            startT <- liftIO getCurrentTime
-            action
-            stopT <- liftIO getCurrentTime
-            liftIO $ print $ diffUTCTime stopT startT
-            liftIO $ putMVar done ()
+        action <-takeMVar start
+        startT <- liftIO getCurrentTime
+        !ex <- try $ runRedis conn $ do
+                  -- liftIO $ putStrLn "Client starting action"
+                  action
+        case ex of
+          Right _ -> return ()
+          Left (e :: SomeException) -> do
+            putStrLn $ "Client exception: " ++ show e
+        stopT <- getCurrentTime
+        print $ diffUTCTime stopT startT
+        putMVar done ()
     
     let timeAction nActions action = do
           startT <- getCurrentTime
