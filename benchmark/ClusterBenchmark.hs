@@ -22,7 +22,7 @@ clusterBenchMark = do
     ----------------------------------------------------------------------
     -- Preparation
     --
-    conn <- connectCluster defaultConnectInfo{connectPort = PortNumber 30001, connectMaxConnections= 50}
+    conn <- connectCluster defaultConnectInfo{connectPort = PortNumber 30001, connectMaxConnections= 200}
     runRedis conn $ do
         _ <- flushall
         _ <- ping >>= \case
@@ -43,7 +43,7 @@ clusterBenchMark = do
     --
     start <- newEmptyMVar
     done  <- newEmptyMVar
-    replicateM_ nClients $ forkIO $ do
+    replicateM_ nClients $ forkIO $ forever $ do
         action <-takeMVar start
         startT <- liftIO getCurrentTime
         !ex <- try $ runRedis conn $ do
@@ -95,7 +95,7 @@ clusterBenchMark = do
     --       _ -> error "error"
     --     return ()
     
-    timeAction 1 $ do
+    timeAction 10 $ do
         res <- mapM get $ keyGenerator 100000 "k1"
         -- liftIO $ threadDelay $ (10 ^ (6 :: Int))*10
         -- res2 <- mapM get $ keyGenerator 100 "k1"
