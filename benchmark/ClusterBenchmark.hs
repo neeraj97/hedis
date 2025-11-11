@@ -11,6 +11,7 @@ import qualified Data.ByteString.Char8 as BS
 import System.Environment (lookupEnv)
 import Data.Maybe (fromMaybe)
 import Text.Read (readMaybe)
+import qualified Data.List.NonEmpty as NE
 
 clusterBenchMark :: IO ()
 clusterBenchMark = do
@@ -22,7 +23,7 @@ clusterBenchMark = do
     maxConnections <- fromMaybe 50 . (>>= readMaybe) <$> lookupEnv "MAX_CONNECTIONS"
     host <- fromMaybe "localhost" . (>>= readMaybe) <$> lookupEnv "HOST"
     port <- fromMaybe 30001 . (>>= readMaybe) <$> lookupEnv "PORT"
-    let  connectInfo = defaultClusterConnectInfo{
+    let  connectInfo = defaultConnectInfo {
               connectHost = host, 
               connectPort = PortNumber port,
               connectMaxConnections = maxConnections
@@ -81,15 +82,14 @@ clusterBenchMark = do
     -- Benchmarks
     --
     timeAction ("XREAD and XDEL"::String) perClientNumRequests $ \key -> do
-        xreadResponses <- runRedis conn $ xreadOpts [(key,"0-0")] (XReadOpts { block = Nothing, recordCount = Just 100, noack = False}) >>= \case
+        xreadResponses <- runRedis conn $ xreadOpts [(key,"0-0")] (XReadOpts { block = Nothing, recordCount = Just 100}) >>= \case
             Right (Just a) -> return a
             Right Nothing -> return []
             _ -> error "error"
-        !ids <- return $ map recordId $ concatMap records xreadResponses  
-        if length ids== 0
-          then return ()
-            else
-              runRedis conn $ xdel key ids >>= \case
+        !ids <- return $ map recordId $ concatMap records xreadResponses 
+        case ids of 
+          [] -> return ()
+          _  -> runRedis conn $ xdel key (NE.fromList ids) >>= \case
                   Left _ -> error "error"
                   Right count -> if count == fromIntegral (length ids)
                                   then return ()
