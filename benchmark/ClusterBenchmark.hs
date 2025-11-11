@@ -81,7 +81,7 @@ clusterBenchMark = do
     -- Benchmarks
     --
     timeAction ("XREAD and XDEL"::String) perClientNumRequests $ \key -> do
-        xreadResponses <- runRedis conn $ xreadOpts [(key,"0-0")] (XReadOpts { block = Nothing, recordCount = Just 1000, noack = False}) >>= \case
+        xreadResponses <- runRedis conn $ xreadOpts [(key,"0-0")] (XReadOpts { block = Nothing, recordCount = Just 100, noack = False}) >>= \case
             Right (Just a) -> return a
             Right Nothing -> return []
             _ -> error "error"
